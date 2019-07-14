@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package raft;
+
+option go_package = "raft";
+
+service Node {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse) {}
+
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse) {}
+}
+
+message AppendEntriesRequest {
+  string name = 1;
+}
+
+message AppendEntriesResponse {
+  string message = 1;
+}
+
+message RequestVoteRequest {
+  string name = 1;
+}
+
+message RequestVoteResponse {
+  string message = 1;
+}
