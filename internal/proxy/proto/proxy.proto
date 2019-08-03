@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package proxy_test;
+
+option go_package = "proxy_test";
+
+service TestNode {
+  rpc Test(TestRequest) returns (TestResponse) {}
+}
+
+message TestRequest {
+}
+
+message TestResponse {
+}

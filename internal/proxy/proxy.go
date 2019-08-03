@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"net/http/httputil"
+
+	"go.uber.org/atomic"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -94,8 +96,12 @@ type FrontendProxy struct {
 	doneChannel      chan error
 }
 
-type BackendProxy struct {
-	backends map[string]*httputil.ReverseProxy
+func (fp *FrontendProxy) AddFirewalRule(endpoint string) {
+	fp.rulesManager.AddFirewalRule(endpoint)
+}
+
+func (fp *FrontendProxy) RemoveFirewalRule(endpoint string) {
+	fp.rulesManager.RemoveFirewalRule(endpoint)
 }
 
 func (fp *FrontendProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +122,7 @@ func (fp *FrontendProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	destinationRoute := fp.rulesManager.GetRoute(destination)
 	if destinationRoute == "" {
 		log.Errorf("no destination to route to")
-		w.WriteHeader(http.StatusServiceUnavailable)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
@@ -137,18 +143,23 @@ func (fp *FrontendProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (fp *FrontendProxy) ListenAndServe() {
 	errChan := make(chan error)
+	errChannelClosed := atomic.NewBool(false)
 
 	// Launch servers
 	for _, server := range fp.servers {
 		go func(server *http.Server, ch chan<- error) {
 			err := server.ListenAndServe()
 			if err != nil && err != http.ErrServerClosed {
-				ch <- err
+				if errChannelClosed.CAS(false, true) {
+					ch <- err
+					close(errChan)
+				}
 			}
 		}(server, errChan)
 	}
 
 	// Wait for the termination of at least one server, or signal of the shutdown
+	var err error
 	go func() {
 		// Shutdown the server
 		select {
@@ -156,8 +167,7 @@ func (fp *FrontendProxy) ListenAndServe() {
 			for _, server := range fp.servers {
 				server.Shutdown(ctx)
 			}
-
-		case err := <-errChan:
+		case err = <-errChan:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
@@ -165,10 +175,10 @@ func (fp *FrontendProxy) ListenAndServe() {
 			for _, server := range fp.servers {
 				server.Shutdown(ctx)
 			}
-
-			fp.doneChannel <- err
-			close(fp.doneChannel)
 		}
+
+		fp.doneChannel <- err
+		close(fp.doneChannel)
 	}()
 }
 
@@ -179,6 +189,7 @@ func (fp *FrontendProxy) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		log.Errorf("context timed out while waiting for server shutdown")
 	case doneError := <-fp.doneChannel:
 		err = doneError
 		log.Errorf("error occured while shutting down server: %+v", err)
@@ -191,6 +202,10 @@ func (fp *FrontendProxy) Shutdown(ctx context.Context) error {
 
 func (fp *FrontendProxy) Done() <-chan error {
 	return fp.doneChannel
+}
+
+type BackendProxy struct {
+	backends map[string]*httputil.ReverseProxy
 }
 
 func (bp *BackendProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
