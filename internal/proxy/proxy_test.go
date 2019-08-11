@@ -7,16 +7,22 @@ import (
 	"net"
 	"net/http"
 	pb "raft/internal/proxy/pb"
+	proxy "raft/internal/proxy"
 	"sync"
 	"testing"
 	"time"
+	"fmt"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/codes"
 )
 
 type testNode struct {
+	endpoint string
 	server            *grpc.Server
 	testNodeClients   map[string]pb.TestNodeClient
 	clientConnections map[string]*grpc.ClientConn
@@ -25,7 +31,7 @@ type testNode struct {
 func newTestNode(t *testing.T, endpoint string) *testNode {
 	lis, err := net.Listen("tcp", endpoint)
 	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
+		t.Fatalf("failed to listen: %v", err)
 	}
 	s := grpc.NewServer()
 	pb.RegisterTestNodeServer(s, &testNode{})
@@ -37,6 +43,7 @@ func newTestNode(t *testing.T, endpoint string) *testNode {
 	}()
 
 	return &testNode{
+		endpoint: endpoint,
 		server:            s,
 		testNodeClients:   make(map[string]pb.TestNodeClient),
 		clientConnections: make(map[string]*grpc.ClientConn),
@@ -51,38 +58,35 @@ func (n *testNode) shutdown() {
 	}
 }
 
-func (n *testNode) registerClient(otherEndpoint string) error {
-	conn, err := grpc.Dial(otherEndpoint, grpc.WithInsecure())
+func (n *testNode) registerClient(name string, otherEndpoint string) error {
+	conn, err := grpc.Dial(otherEndpoint, grpc.WithInsecure(), grpc.WithAuthority(otherEndpoint))
 	if err != nil {
 		log.Errorf("did not connect: %v", err)
 		return err
 	}
-	n.testNodeClients[otherEndpoint] = pb.NewTestNodeClient(conn)
-	n.clientConnections[otherEndpoint] = conn
+	n.testNodeClients[name] = pb.NewTestNodeClient(conn)
+	n.clientConnections[name] = conn
 
 	return nil
 }
 
 func (n *testNode) Test(ctx context.Context, in *pb.TestRequest) (*pb.TestResponse, error) {
-	log.Printf("received: %+v", in)
+	log.Printf("received ctx: %+v. req %+v", ctx, in)
 	return &pb.TestResponse{}, nil
 }
 
-func (n *testNode) sendTestMessage(ctx context.Context) []error {
+func (n *testNode) sendTestMessages(ctx context.Context) []error {
 	errors := make([]error, len(n.testNodeClients))
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(n.testNodeClients))
 	i := 0
-	for endpoint, client := range n.testNodeClients {
-		go func(c pb.TestNodeClient, err *error) {
+	for endpoint, _ := range n.testNodeClients {
+		go func(err *error) {
 			defer wg.Done()
 
-			log.Printf("sending grpc request to %s", endpoint)
-			_, grpcErr := c.Test(ctx, &pb.TestRequest{})
-			log.Printf("received grpc response from %s: %+v", endpoint, err)
-			*err = grpcErr
-		}(client, &errors[i])
+			*err = n.sendTestMessage(ctx, endpoint)
+		}(&errors[i])
 
 		i++
 	}
@@ -92,7 +96,22 @@ func (n *testNode) sendTestMessage(ctx context.Context) []error {
 	return errors
 }
 
-func TestProxy(t *testing.T) {
+func (n *testNode) sendTestMessage(ctx context.Context, endpoint string) error {
+	client, ok := n.testNodeClients[endpoint]
+	if !ok{
+		return fmt.Errorf("no client with endpoint: %s", endpoint)
+	}
+
+	ctx = metadata.AppendToOutgoingContext(ctx, "dest", endpoint, "src", n.endpoint)
+
+	log.Printf("sending grpc request to %s", endpoint)
+	_, err := client.Test(ctx, &pb.TestRequest{})
+	log.Printf("received grpc response from %s: %+v", endpoint, err)
+
+	return err
+}
+
+func TestNodes(t *testing.T) {
 	endpoints := []string{
 		"localhost:9001", "localhost:9002",
 	}
@@ -100,7 +119,10 @@ func TestProxy(t *testing.T) {
 
 	for i := range nodes {
 		nodes[i] = newTestNode(t, endpoints[i])
-		defer nodes[i].shutdown()
+		defer func(i int) {
+			log.Printf("shutting down nodes %d", i)
+			nodes[i].shutdown()
+		}(i)
 	}
 
 	for i := range nodes {
@@ -109,15 +131,176 @@ func TestProxy(t *testing.T) {
 				continue
 			}
 
-			nodes[i].registerClient(endpoints[i])
+			nodes[i].registerClient(endpoints[j], endpoints[i])
 		}
 	}
 
 	for i := range nodes {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		errors := nodes[i].sendTestMessage(ctx)
+		errors := nodes[i].sendTestMessages(ctx)
+		for _, err := range errors {
+			assert.NoError(t, err)
+		}
+	}
+}
+
+func TestGrpcProxy(t *testing.T){
+	proxyEndpoint := "localhost:9000"
+	lis, err := net.Listen("tcp", proxyEndpoint)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	endpoints := []string{
+		"localhost:9001", "localhost:9002",
+	}
+
+	router := proxy.NewRouter(endpoints)
+
+	p := proxy.NewProcessor(router.Route)
+	defer func(){
+		log.Printf("shutting down server")
+		p.GracefulStop()
+	}() 
+
+	go func() {
+		if err := p.Serve(lis); err != nil && err != http.ErrServerClosed {
+			t.Fatalf("failed to serve: %v", err)
+		}
+	}()
+
+	nodes := make([]*testNode, len(endpoints))
+
+	// Start all test nodes
+	for i := range nodes {
+		nodes[i] = newTestNode(t, endpoints[i])
+		defer func(i int) {
+			log.Printf("shutting down nodes %d", i)
+			nodes[i].shutdown()
+		}(i)
+	}
+
+	// Register all relations between test nodes
+	for i := range nodes {
+		for j := range nodes {
+			if i == j {
+				continue
+			}
+
+			nodes[i].registerClient(endpoints[j], proxyEndpoint)
+		}
+	}
+
+	// Send messages from each test node to each test node
+	for i := range nodes {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		errors := nodes[i].sendTestMessages(ctx)
+		for _, err := range errors {
+			assert.NoError(t, err)
+		}
+	}
+}
+
+func TestFirewall(t *testing.T){
+	proxyEndpoint := "localhost:9000"
+	lis, err := net.Listen("tcp", proxyEndpoint)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	endpoints := []string{
+		"localhost:9001", "localhost:9002",
+	}
+
+	router := proxy.NewRouter(endpoints)
+
+	p := proxy.NewProcessor(router.Route)
+	defer func(){
+		log.Printf("shutting down server")
+		p.GracefulStop()
+	}() 
+
+	go func() {
+		if err := p.Serve(lis); err != nil && err != http.ErrServerClosed {
+			t.Fatalf("failed to serve: %v", err)
+		}
+	}()
+
+	nodes := make([]*testNode, len(endpoints))
+
+	// Start all test nodes
+	for i := range nodes {
+		nodes[i] = newTestNode(t, endpoints[i])
+		defer func(i int) {
+			log.Printf("shutting down nodes %d", i)
+			nodes[i].shutdown()
+		}(i)
+	}
+
+	// Register all relations between test nodes
+	for i := range nodes {
+		for j := range nodes {
+			if i == j {
+				continue
+			}
+
+			nodes[i].registerClient(endpoints[j], proxyEndpoint)
+		}
+	}
+
+	// Send messages from each test node to each test node
+	for i := range nodes {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		errors := nodes[i].sendTestMessages(ctx)
+		for _, err := range errors {
+			assert.NoError(t, err)
+		}
+	}
+
+	// Put Node 1 under firewall
+	router.AddFirewalRule(endpoints[0])
+	
+	// Send message from Node 2 to Node 1 
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+	
+		err := nodes[1].sendTestMessage(ctx, endpoints[0])
+		grpcError, ok := status.FromError(err)
+		if !ok {
+			t.Fatalf("error is not a grpc error")
+		}
+		assert.Equal(t, grpcError.Code(), codes.Unavailable)
+	}
+
+	// Send message from Node 1 to Node 2
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+	
+		err := nodes[0].sendTestMessage(ctx, endpoints[1])
+		grpcError, ok := status.FromError(err)
+		if !ok {
+			t.Fatalf("error is not a grpc error")
+		}
+		assert.Equal(t, grpcError.Code(), codes.Unavailable)
+	}
+	
+	// Remove Node 1 from firewall
+	router.RemoveFirewalRule(endpoints[0])
+
+	// Send messages to test 
+	for i := range nodes {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		errors := nodes[i].sendTestMessages(ctx)
 		for _, err := range errors {
 			assert.NoError(t, err)
 		}
