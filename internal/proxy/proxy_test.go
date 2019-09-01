@@ -4,25 +4,25 @@ package proxy_test
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
-	pb "raft/internal/proxy/pb"
 	proxy "raft/internal/proxy"
+	pb "raft/internal/proxy/pb"
 	"sync"
 	"testing"
 	"time"
-	"fmt"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/codes"
 )
 
 type testNode struct {
-	endpoint string
+	endpoint          string
 	server            *grpc.Server
 	testNodeClients   map[string]pb.TestNodeClient
 	clientConnections map[string]*grpc.ClientConn
@@ -43,7 +43,7 @@ func newTestNode(t *testing.T, endpoint string) *testNode {
 	}()
 
 	return &testNode{
-		endpoint: endpoint,
+		endpoint:          endpoint,
 		server:            s,
 		testNodeClients:   make(map[string]pb.TestNodeClient),
 		clientConnections: make(map[string]*grpc.ClientConn),
@@ -98,7 +98,7 @@ func (n *testNode) sendTestMessages(ctx context.Context) []error {
 
 func (n *testNode) sendTestMessage(ctx context.Context, endpoint string) error {
 	client, ok := n.testNodeClients[endpoint]
-	if !ok{
+	if !ok {
 		return fmt.Errorf("no client with endpoint: %s", endpoint)
 	}
 
@@ -146,7 +146,7 @@ func TestNodes(t *testing.T) {
 	}
 }
 
-func TestGrpcProxy(t *testing.T){
+func TestGrpcProxy(t *testing.T) {
 	proxyEndpoint := "localhost:9000"
 	lis, err := net.Listen("tcp", proxyEndpoint)
 	if err != nil {
@@ -160,10 +160,10 @@ func TestGrpcProxy(t *testing.T){
 	router := proxy.NewRouter(endpoints)
 
 	p := proxy.NewProcessor(router.Route)
-	defer func(){
-		log.Printf("shutting down server")
+	defer func() {
+		log.Printf("shutting down proxy server")
 		p.GracefulStop()
-	}() 
+	}()
 
 	go func() {
 		if err := p.Serve(lis); err != nil && err != http.ErrServerClosed {
@@ -205,7 +205,7 @@ func TestGrpcProxy(t *testing.T){
 	}
 }
 
-func TestFirewall(t *testing.T){
+func TestFirewall(t *testing.T) {
 	proxyEndpoint := "localhost:9000"
 	lis, err := net.Listen("tcp", proxyEndpoint)
 	if err != nil {
@@ -219,10 +219,10 @@ func TestFirewall(t *testing.T){
 	router := proxy.NewRouter(endpoints)
 
 	p := proxy.NewProcessor(router.Route)
-	defer func(){
+	defer func() {
 		log.Printf("shutting down server")
 		p.GracefulStop()
-	}() 
+	}()
 
 	go func() {
 		if err := p.Serve(lis); err != nil && err != http.ErrServerClosed {
@@ -264,13 +264,13 @@ func TestFirewall(t *testing.T){
 	}
 
 	// Put Node 1 under firewall
-	router.AddFirewalRule(endpoints[0])
-	
-	// Send message from Node 2 to Node 1 
+	router.AddFirewallRule(endpoints[0])
+
+	// Send message from Node 2 to Node 1
 	{
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-	
+
 		err := nodes[1].sendTestMessage(ctx, endpoints[0])
 		grpcError, ok := status.FromError(err)
 		if !ok {
@@ -281,9 +281,9 @@ func TestFirewall(t *testing.T){
 
 	// Send message from Node 1 to Node 2
 	{
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-	
+
 		err := nodes[0].sendTestMessage(ctx, endpoints[1])
 		grpcError, ok := status.FromError(err)
 		if !ok {
@@ -291,11 +291,11 @@ func TestFirewall(t *testing.T){
 		}
 		assert.Equal(t, grpcError.Code(), codes.Unavailable)
 	}
-	
-	// Remove Node 1 from firewall
-	router.RemoveFirewalRule(endpoints[0])
 
-	// Send messages to test 
+	// Remove Node 1 from firewall
+	router.RemoveFirewallRule(endpoints[0])
+
+	// Send messages to test
 	for i := range nodes {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()

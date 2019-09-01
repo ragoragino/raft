@@ -15,9 +15,9 @@ import (
 // It parses grpc metadata headers, src and dest, to make routing decisions
 
 type IRouter interface {
-	AddFirewalRule(endpoint string) 
-	RemoveFirewalRule(endpoint string) 
-	Route(md metadata.MD) (string, error) 
+	AddFirewallRule(endpoint string)
+	RemoveFirewallRule(endpoint string)
+	Route(md metadata.MD) (string, error)
 }
 
 type Router struct {
@@ -31,7 +31,7 @@ func NewRouter(endpoints []string) *Router {
 	}
 }
 
-func (rm *Router) AddFirewalRule(endpoint string) {
+func (rm *Router) AddFirewallRule(endpoint string) {
 	log.Debugf("adding firewall rule for %s", endpoint)
 
 	rm.firewalMutex.Lock()
@@ -39,7 +39,7 @@ func (rm *Router) AddFirewalRule(endpoint string) {
 	rm.firewalMutex.Unlock()
 }
 
-func (rm *Router) RemoveFirewalRule(endpoint string) {
+func (rm *Router) RemoveFirewallRule(endpoint string) {
 	log.Debugf("removing firewall rule for %s", endpoint)
 
 	rm.firewalMutex.Lock()

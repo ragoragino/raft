@@ -103,7 +103,10 @@ func (m *AppendEntriesResponse) GetMessage() string {
 }
 
 type RequestVoteRequest struct {
-	Name                 string   `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Term                 int64    `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	CandidateId          int64    `protobuf:"varint,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
+	LastLogIndex         int64    `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm          int64    `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -134,15 +137,37 @@ func (m *RequestVoteRequest) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_RequestVoteRequest proto.InternalMessageInfo
 
-func (m *RequestVoteRequest) GetName() string {
+func (m *RequestVoteRequest) GetTerm() int64 {
 	if m != nil {
-		return m.Name
+		return m.Term
 	}
-	return ""
+	return 0
+}
+
+func (m *RequestVoteRequest) GetCandidateId() int64 {
+	if m != nil {
+		return m.CandidateId
+	}
+	return 0
+}
+
+func (m *RequestVoteRequest) GetLastLogIndex() int64 {
+	if m != nil {
+		return m.LastLogIndex
+	}
+	return 0
+}
+
+func (m *RequestVoteRequest) GetLastLogTerm() int64 {
+	if m != nil {
+		return m.LastLogTerm
+	}
+	return 0
 }
 
 type RequestVoteResponse struct {
-	Message              string   `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	Term                 int64    `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	VoteGranted          bool     `protobuf:"varint,2,opt,name=vote_granted,json=voteGranted,proto3" json:"vote_granted,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -173,11 +198,206 @@ func (m *RequestVoteResponse) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_RequestVoteResponse proto.InternalMessageInfo
 
-func (m *RequestVoteResponse) GetMessage() string {
+func (m *RequestVoteResponse) GetTerm() int64 {
 	if m != nil {
-		return m.Message
+		return m.Term
+	}
+	return 0
+}
+
+func (m *RequestVoteResponse) GetVoteGranted() bool {
+	if m != nil {
+		return m.VoteGranted
+	}
+	return false
+}
+
+type InsertRequest struct {
+	Key                  string   `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Payload              []byte   `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *InsertRequest) Reset()         { *m = InsertRequest{} }
+func (m *InsertRequest) String() string { return proto.CompactTextString(m) }
+func (*InsertRequest) ProtoMessage()    {}
+func (*InsertRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_b042552c306ae59b, []int{4}
+}
+
+func (m *InsertRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_InsertRequest.Unmarshal(m, b)
+}
+func (m *InsertRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_InsertRequest.Marshal(b, m, deterministic)
+}
+func (m *InsertRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_InsertRequest.Merge(m, src)
+}
+func (m *InsertRequest) XXX_Size() int {
+	return xxx_messageInfo_InsertRequest.Size(m)
+}
+func (m *InsertRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_InsertRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_InsertRequest proto.InternalMessageInfo
+
+func (m *InsertRequest) GetKey() string {
+	if m != nil {
+		return m.Key
 	}
 	return ""
+}
+
+func (m *InsertRequest) GetPayload() []byte {
+	if m != nil {
+		return m.Payload
+	}
+	return nil
+}
+
+type InsertResponse struct {
+	Success              bool     `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Leader               string   `protobuf:"bytes,2,opt,name=leader,proto3" json:"leader,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *InsertResponse) Reset()         { *m = InsertResponse{} }
+func (m *InsertResponse) String() string { return proto.CompactTextString(m) }
+func (*InsertResponse) ProtoMessage()    {}
+func (*InsertResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_b042552c306ae59b, []int{5}
+}
+
+func (m *InsertResponse) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_InsertResponse.Unmarshal(m, b)
+}
+func (m *InsertResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_InsertResponse.Marshal(b, m, deterministic)
+}
+func (m *InsertResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_InsertResponse.Merge(m, src)
+}
+func (m *InsertResponse) XXX_Size() int {
+	return xxx_messageInfo_InsertResponse.Size(m)
+}
+func (m *InsertResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_InsertResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_InsertResponse proto.InternalMessageInfo
+
+func (m *InsertResponse) GetSuccess() bool {
+	if m != nil {
+		return m.Success
+	}
+	return false
+}
+
+func (m *InsertResponse) GetLeader() string {
+	if m != nil {
+		return m.Leader
+	}
+	return ""
+}
+
+type FindRequest struct {
+	Key                  string   `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *FindRequest) Reset()         { *m = FindRequest{} }
+func (m *FindRequest) String() string { return proto.CompactTextString(m) }
+func (*FindRequest) ProtoMessage()    {}
+func (*FindRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_b042552c306ae59b, []int{6}
+}
+
+func (m *FindRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_FindRequest.Unmarshal(m, b)
+}
+func (m *FindRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_FindRequest.Marshal(b, m, deterministic)
+}
+func (m *FindRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_FindRequest.Merge(m, src)
+}
+func (m *FindRequest) XXX_Size() int {
+	return xxx_messageInfo_FindRequest.Size(m)
+}
+func (m *FindRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_FindRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_FindRequest proto.InternalMessageInfo
+
+func (m *FindRequest) GetKey() string {
+	if m != nil {
+		return m.Key
+	}
+	return ""
+}
+
+type FindResponse struct {
+	Success              bool     `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Leader               string   `protobuf:"bytes,2,opt,name=leader,proto3" json:"leader,omitempty"`
+	Payload              []byte   `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *FindResponse) Reset()         { *m = FindResponse{} }
+func (m *FindResponse) String() string { return proto.CompactTextString(m) }
+func (*FindResponse) ProtoMessage()    {}
+func (*FindResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_b042552c306ae59b, []int{7}
+}
+
+func (m *FindResponse) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_FindResponse.Unmarshal(m, b)
+}
+func (m *FindResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_FindResponse.Marshal(b, m, deterministic)
+}
+func (m *FindResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_FindResponse.Merge(m, src)
+}
+func (m *FindResponse) XXX_Size() int {
+	return xxx_messageInfo_FindResponse.Size(m)
+}
+func (m *FindResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_FindResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_FindResponse proto.InternalMessageInfo
+
+func (m *FindResponse) GetSuccess() bool {
+	if m != nil {
+		return m.Success
+	}
+	return false
+}
+
+func (m *FindResponse) GetLeader() string {
+	if m != nil {
+		return m.Leader
+	}
+	return ""
+}
+
+func (m *FindResponse) GetPayload() []byte {
+	if m != nil {
+		return m.Payload
+	}
+	return nil
 }
 
 func init() {
@@ -185,24 +405,42 @@ func init() {
 	proto.RegisterType((*AppendEntriesResponse)(nil), "raft.AppendEntriesResponse")
 	proto.RegisterType((*RequestVoteRequest)(nil), "raft.RequestVoteRequest")
 	proto.RegisterType((*RequestVoteResponse)(nil), "raft.RequestVoteResponse")
+	proto.RegisterType((*InsertRequest)(nil), "raft.InsertRequest")
+	proto.RegisterType((*InsertResponse)(nil), "raft.InsertResponse")
+	proto.RegisterType((*FindRequest)(nil), "raft.FindRequest")
+	proto.RegisterType((*FindResponse)(nil), "raft.FindResponse")
 }
 
 func init() { proto.RegisterFile("raft.proto", fileDescriptor_b042552c306ae59b) }
 
 var fileDescriptor_b042552c306ae59b = []byte{
-	// 188 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xe2, 0xe2, 0x2a, 0x4a, 0x4c, 0x2b,
-	0xd1, 0x2b, 0x28, 0xca, 0x2f, 0xc9, 0x17, 0x62, 0x01, 0xb1, 0x95, 0xb4, 0xb8, 0x44, 0x1c, 0x0b,
-	0x0a, 0x52, 0xf3, 0x52, 0x5c, 0xf3, 0x4a, 0x8a, 0x32, 0x53, 0x8b, 0x83, 0x52, 0x0b, 0x4b, 0x53,
-	0x8b, 0x4b, 0x84, 0x84, 0xb8, 0x58, 0xf2, 0x12, 0x73, 0x53, 0x25, 0x18, 0x15, 0x18, 0x35, 0x38,
-	0x83, 0xc0, 0x6c, 0x25, 0x43, 0x2e, 0x51, 0x34, 0xb5, 0xc5, 0x05, 0xf9, 0x79, 0xc5, 0xa9, 0x42,
-	0x12, 0x5c, 0xec, 0xb9, 0xa9, 0xc5, 0xc5, 0x89, 0xe9, 0x30, 0xf5, 0x30, 0xae, 0x92, 0x06, 0x97,
-	0x10, 0xd4, 0xc4, 0xb0, 0xfc, 0x92, 0x54, 0x7c, 0x86, 0xeb, 0x73, 0x09, 0xa3, 0xa8, 0x24, 0x64,
-	0xb4, 0xd1, 0x0c, 0x46, 0x2e, 0x16, 0xbf, 0xfc, 0x94, 0x54, 0x21, 0x2f, 0x2e, 0x5e, 0x14, 0x67,
-	0x09, 0x49, 0xe9, 0x81, 0xbd, 0x89, 0xcd, 0x5f, 0x52, 0xd2, 0x58, 0xe5, 0x20, 0x96, 0x29, 0x31,
-	0x08, 0xb9, 0x70, 0x71, 0x23, 0xb9, 0x42, 0x48, 0x02, 0xa2, 0x1a, 0xd3, 0x0b, 0x52, 0x92, 0x58,
-	0x64, 0x60, 0xa6, 0x38, 0xb1, 0x45, 0x81, 0x03, 0x37, 0x89, 0x0d, 0x1c, 0xd2, 0xc6, 0x80, 0x00,
-	0x00, 0x00, 0xff, 0xff, 0xbe, 0xf6, 0x15, 0x63, 0x77, 0x01, 0x00, 0x00,
+	// 406 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x9c, 0x53, 0x3d, 0x8f, 0xd4, 0x30,
+	0x10, 0x65, 0x2f, 0x51, 0xb8, 0x9b, 0x64, 0x4f, 0x30, 0x77, 0xa0, 0x10, 0x0a, 0xc0, 0xa2, 0x40,
+	0x14, 0x87, 0x00, 0x51, 0x51, 0x71, 0xe2, 0x43, 0x8b, 0x4e, 0x14, 0x11, 0xa2, 0xd8, 0x26, 0x32,
+	0xeb, 0x21, 0x8a, 0x48, 0xec, 0x60, 0x7b, 0x11, 0xdb, 0xf1, 0x27, 0xf8, 0xbf, 0x28, 0x76, 0x12,
+	0x12, 0xd8, 0x6d, 0xe8, 0x66, 0xde, 0x3c, 0x3f, 0xcf, 0x3c, 0x8f, 0x01, 0x34, 0xff, 0x62, 0x2f,
+	0x5a, 0xad, 0xac, 0xc2, 0xb0, 0x8b, 0xd9, 0x63, 0x38, 0x7f, 0xd5, 0xb6, 0x24, 0xc5, 0x1b, 0x69,
+	0x75, 0x45, 0x26, 0xa7, 0x6f, 0x5b, 0x32, 0x16, 0x11, 0x42, 0xc9, 0x1b, 0x4a, 0x17, 0xf7, 0x17,
+	0x8f, 0x4e, 0x72, 0x17, 0xb3, 0xa7, 0x70, 0xeb, 0x2f, 0xae, 0x69, 0x95, 0x34, 0x84, 0x29, 0x5c,
+	0x6f, 0xc8, 0x18, 0x5e, 0x0e, 0xfc, 0x21, 0x65, 0xbf, 0x16, 0x80, 0xbd, 0xe4, 0x27, 0x65, 0x69,
+	0xa2, 0x6e, 0x49, 0x37, 0x8e, 0x1d, 0xe4, 0x2e, 0xc6, 0x07, 0x90, 0x6c, 0xb8, 0x14, 0x95, 0xe0,
+	0x96, 0x8a, 0x4a, 0xa4, 0x47, 0xae, 0x16, 0x8f, 0xd8, 0x4a, 0xe0, 0x43, 0x38, 0xad, 0xb9, 0xb1,
+	0x45, 0xad, 0xca, 0xa2, 0x92, 0x82, 0x7e, 0xa4, 0x81, 0x23, 0x25, 0x1d, 0x7a, 0xa5, 0xca, 0x55,
+	0x87, 0x21, 0x83, 0xe5, 0xc8, 0x72, 0xb7, 0x84, 0x5e, 0xa9, 0x27, 0x7d, 0x24, 0xdd, 0xb0, 0x2b,
+	0x38, 0x9b, 0xb5, 0xd5, 0x0f, 0x72, 0xa0, 0xaf, 0xef, 0xca, 0x52, 0x51, 0x6a, 0x2e, 0x2d, 0xf9,
+	0xbe, 0x8e, 0xf3, 0xb8, 0xc3, 0xde, 0x79, 0x88, 0xbd, 0x84, 0xe5, 0x4a, 0x1a, 0xd2, 0x76, 0x98,
+	0xef, 0x06, 0x04, 0x5f, 0x69, 0xd7, 0x9b, 0xd1, 0x85, 0x9d, 0x45, 0x2d, 0xdf, 0xd5, 0x8a, 0x7b,
+	0x81, 0x24, 0x1f, 0x52, 0x76, 0x09, 0xa7, 0xc3, 0xe1, 0x3f, 0x76, 0x9a, 0xed, 0x66, 0x43, 0xc6,
+	0x38, 0x85, 0xe3, 0x7c, 0x48, 0xf1, 0x36, 0x44, 0x35, 0x71, 0x41, 0xda, 0x89, 0x9c, 0xe4, 0x7d,
+	0xc6, 0xee, 0x41, 0xfc, 0xb6, 0x92, 0xe2, 0xe0, 0xf5, 0x6c, 0x0d, 0x89, 0x27, 0xfc, 0xef, 0x15,
+	0xd3, 0x01, 0x82, 0xd9, 0x00, 0xcf, 0x7e, 0x1e, 0x41, 0xf8, 0x41, 0x09, 0xc2, 0xf7, 0xb0, 0x9c,
+	0xed, 0x07, 0x66, 0x17, 0x6e, 0xdf, 0xf6, 0x2d, 0x58, 0x76, 0x77, 0x6f, 0xcd, 0xb7, 0xc7, 0xae,
+	0xe1, 0x6b, 0x88, 0x27, 0x0f, 0x84, 0xa9, 0x67, 0xff, 0xbb, 0x4a, 0xd9, 0x9d, 0x3d, 0x95, 0x51,
+	0xe5, 0x05, 0x44, 0xde, 0x5b, 0x3c, 0xf3, 0xb4, 0xd9, 0x33, 0x65, 0xe7, 0x73, 0x70, 0x3c, 0xf6,
+	0x04, 0xc2, 0xce, 0x2d, 0xbc, 0xe9, 0xeb, 0x13, 0x6b, 0x33, 0x9c, 0x42, 0xc3, 0x81, 0xcb, 0x68,
+	0xed, 0x7e, 0xd3, 0xe7, 0xc8, 0x7d, 0xad, 0xe7, 0xbf, 0x03, 0x00, 0x00, 0xff, 0xff, 0x0d, 0x9e,
+	0x45, 0xdd, 0x68, 0x03, 0x00, 0x00,
 }
 
 // Reference imports to suppress errors if they are not otherwise used.
@@ -217,8 +455,12 @@ const _ = grpc.SupportPackageIsVersion4
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
 type NodeClient interface {
+	// cluster methods
 	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
 	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
+	// client methods
+	Insert(ctx context.Context, in *InsertRequest, opts ...grpc.CallOption) (*InsertResponse, error)
+	Find(ctx context.Context, in *FindRequest, opts ...grpc.CallOption) (*FindResponse, error)
 }
 
 type nodeClient struct {
@@ -247,10 +489,32 @@ func (c *nodeClient) RequestVote(ctx context.Context, in *RequestVoteRequest, op
 	return out, nil
 }
 
+func (c *nodeClient) Insert(ctx context.Context, in *InsertRequest, opts ...grpc.CallOption) (*InsertResponse, error) {
+	out := new(InsertResponse)
+	err := c.cc.Invoke(ctx, "/raft.Node/Insert", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeClient) Find(ctx context.Context, in *FindRequest, opts ...grpc.CallOption) (*FindResponse, error) {
+	out := new(FindResponse)
+	err := c.cc.Invoke(ctx, "/raft.Node/Find", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NodeServer is the server API for Node service.
 type NodeServer interface {
+	// cluster methods
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
 	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
+	// client methods
+	Insert(context.Context, *InsertRequest) (*InsertResponse, error)
+	Find(context.Context, *FindRequest) (*FindResponse, error)
 }
 
 // UnimplementedNodeServer can be embedded to have forward compatible implementations.
@@ -262,6 +526,12 @@ func (*UnimplementedNodeServer) AppendEntries(ctx context.Context, req *AppendEn
 }
 func (*UnimplementedNodeServer) RequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RequestVote not implemented")
+}
+func (*UnimplementedNodeServer) Insert(ctx context.Context, req *InsertRequest) (*InsertResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Insert not implemented")
+}
+func (*UnimplementedNodeServer) Find(ctx context.Context, req *FindRequest) (*FindResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Find not implemented")
 }
 
 func RegisterNodeServer(s *grpc.Server, srv NodeServer) {
@@ -304,6 +574,42 @@ func _Node_RequestVote_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Node_Insert_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InsertRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServer).Insert(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/raft.Node/Insert",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServer).Insert(ctx, req.(*InsertRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Node_Find_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FindRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServer).Find(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/raft.Node/Find",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServer).Find(ctx, req.(*FindRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 var _Node_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "raft.Node",
 	HandlerType: (*NodeServer)(nil),
@@ -315,6 +621,14 @@ var _Node_serviceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RequestVote",
 			Handler:    _Node_RequestVote_Handler,
+		},
+		{
+			MethodName: "Insert",
+			Handler:    _Node_Insert_Handler,
+		},
+		{
+			MethodName: "Find",
+			Handler:    _Node_Find_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

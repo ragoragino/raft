@@ -5,9 +5,15 @@ package raft;
 option go_package = "raft";
 
 service Node {
+  // cluster methods
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse) {}
 
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse) {}
+
+  // client methods
+  rpc Insert(InsertRequest) returns (InsertResponse) {}
+
+  rpc Find(FindRequest) returns (FindResponse) {}
 }
 
 message AppendEntriesRequest {
@@ -19,9 +25,34 @@ message AppendEntriesResponse {
 }
 
 message RequestVoteRequest {
-  string name = 1;
+  int64 term = 1;
+  int64 candidate_id = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
 }
 
 message RequestVoteResponse {
-  string message = 1;
+  int64 term = 1;
+  bool vote_granted = 2;
+}
+
+message InsertRequest {
+  string key = 1;
+  bytes payload = 2;
+}
+
+message InsertResponse {
+  bool success = 1;
+  string leader = 2;
+}
+
+message FindRequest {
+  string key = 1;
+}
+
+message FindResponse {
+  bool success = 1;
+  string leader = 2;
+
+  bytes payload = 3;
 }
