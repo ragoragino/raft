@@ -4,11 +4,18 @@ package node
 
 import (
 	"context"
+	"math/rand"
 	pb "raft/internal/raft/node/gen"
 	"sync"
+	"time"
 )
 
 type ServerRole int
+
+type Settings struct {
+	MaxElectionTimeout time.Duration
+	MinElectionTimeout time.Duration
+}
 
 const (
 	FOLLOWER ServerRole = iota
@@ -22,38 +29,70 @@ type LogEntry struct {
 }
 
 type State struct {
-	currentTerm int64
-	votedFor    *int64
-	log         []LogEntry
+	CurrentTerm int64
+	VotedFor    *int64
+	Log         []LogEntry
+	Role        ServerRole
+
+	stateMutex sync.RWMutex
 }
 
 func (s *State) GetCurrentTerm() int64 {
-	return s.currentTerm
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
+	return s.CurrentTerm
 }
 
 func (s *State) GetVotedFor() *int64 {
-	return s.votedFor
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
+	return s.VotedFor
+}
+
+func (s *State) GetRole() ServerRole {
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
+	return s.Role
 }
 
 func (s *State) GetLastLogIndex() int64 {
-	return int64(len(s.log) + 1)
+	return int64(len(s.Log) + 1)
 }
 
 func (s *State) GetLastLogTerm() int64 {
-	return s.log[len(s.log)-1].Term
+	return s.Log[len(s.Log)-1].Term
+}
+
+func (s *State) SwitchState(term int64, votedFor *int64, role ServerRole) {
+	s.stateMutex.Lock()
+	defer s.stateMutex.Unlock()
+
+	s.CurrentTerm = term
+	s.VotedFor = votedFor
+	s.Role = role
+}
+
+type appendEntriesEvent struct {
+	term int64
+}
+
+type requestVoteEvent struct {
+	term        int64
+	voteGranted bool
 }
 
 type Server struct {
-	cluster     ICluster
-	state       State
-	roleMutex   sync.RWMutex
-	role        ServerRole
-	roleChannel chan ServerRole
+	settings Settings
+	cluster  ICluster
+	state    State
+
+	appendEntriesChannel chan appendEntriesEvent
+	requestVotesChannel  chan requestVoteEvent
 }
 
 func (s *Server) RequestVote(ctx context.Context, request *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	rejectResponse := &pb.RequestVoteResponse{
-		Term:        s.state.currentTerm,
+		Term:        s.state.CurrentTerm,
 		VoteGranted: false,
 	}
 
@@ -79,10 +118,7 @@ func (s *Server) RequestVote(ctx context.Context, request *pb.RequestVoteRequest
 }
 
 func (s *Server) Insert(ctx context.Context, in *pb.InsertRequest) (*pb.InsertResponse, error) {
-	s.roleMutex.RLock()
-	if s.role != LEADER {
-		s.roleMutex.RUnlock()
-
+	if s.state.GetRole() != LEADER {
 		leaderIP := s.cluster.GetLeaderIP()
 
 		return &pb.InsertResponse{
@@ -90,7 +126,6 @@ func (s *Server) Insert(ctx context.Context, in *pb.InsertRequest) (*pb.InsertRe
 			Leader:  leaderIP,
 		}, nil
 	}
-	s.roleMutex.RUnlock()
 
 	// TODO: Implement the case when the node is the leader
 
@@ -100,9 +135,7 @@ func (s *Server) Insert(ctx context.Context, in *pb.InsertRequest) (*pb.InsertRe
 }
 
 func (s *Server) Find(ctx context.Context, in *pb.FindRequest) (*pb.FindResponse, error) {
-	s.roleMutex.RLock()
-	if s.role != LEADER {
-		s.roleMutex.RUnlock()
+	if s.state.GetRole() != LEADER {
 
 		leaderIP := s.cluster.GetLeaderIP()
 
@@ -111,7 +144,6 @@ func (s *Server) Find(ctx context.Context, in *pb.FindRequest) (*pb.FindResponse
 			Leader:  leaderIP,
 		}, nil
 	}
-	s.roleMutex.RUnlock()
 
 	// TODO: Implement the case when the node is the leader
 
@@ -121,42 +153,127 @@ func (s *Server) Find(ctx context.Context, in *pb.FindRequest) (*pb.FindResponse
 }
 
 func (s *Server) Run() {
-	doneChannel := make(chan struct{})
-
-	// Starting server as a follower
-	s.roleMutex.Lock()
-	s.role = FOLLOWER
-	s.roleMutex.Unlock()
+	s.state.SwitchState(1, nil, FOLLOWER)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s.HandleStateFollower(ctx, doneChannel)
+	doneChannel := s.HandleStateFollower(ctx)
 
 	for {
-		// Waiting for the change of state
-		newRole := <-s.roleChannel
-
-		// NOTE: no need for mutex here, as only this method can modify s.role
-		if s.role == newRole {
-			continue
-		}
-
-		// Killing the previous state
-		cancel()
+		// Waiting for the definitive end of the previous state
 		<-doneChannel
+		cancel()
 
 		// Setting up the new state
-		s.roleMutex.Lock()
-		s.role = newRole
-		s.roleMutex.Unlock()
+		newRole := s.state.GetRole()
 
 		ctx, cancel = context.WithCancel(context.Background())
 		switch newRole {
 		case FOLLOWER:
-			s.HandleStateFollower(ctx, doneChannel)
+			doneChannel = s.HandleStateFollower(ctx)
 		case CANDIDATE:
-			s.HandleStateCandidate(ctx, doneChannel)
+			doneChannel = s.HandleStateCandidate(ctx)
 		case LEADER:
-			s.HandleStateLeader(ctx, doneChannel)
+			doneChannel = s.HandleStateLeader(ctx)
 		}
 	}
+}
+
+func (s *Server) HandleStateFollower(ctx context.Context) <-chan struct{} {
+	doneChannel := make(chan struct{})
+
+	go func() {
+		electionTimeout := newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
+
+	outerloop:
+		for {
+			select {
+			case event := <-s.appendEntriesChannel:
+				// TODO: this should concern only when AppendEntries is sent by the leader!
+				electionTimeout = newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
+			case event := <-s.requestVotesChannel:
+				if event.voteGranted {
+					electionTimeout = newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
+				}
+			case <-time.After(electionTimeout):
+				newTerm := s.state.GetCurrentTerm() + 1
+				votedFor := int64(0) // TODO
+				s.state.SwitchState(newTerm, &votedFor, CANDIDATE)
+
+				break outerloop
+			case <-ctx.Done():
+				break outerloop
+			}
+		}
+
+		close(doneChannel)
+	}()
+
+	return doneChannel
+}
+
+func (s *Server) HandleStateCandidate(ctx context.Context) <-chan struct{} {
+	doneChannel := make(chan struct{})
+
+	go func() {
+
+		electionTimeout := newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
+		isLeaderChannel := s.SendRequestVoteRPCs()
+
+	outerloop:
+		for {
+			select {
+			case <-isLeaderChannel:
+				newTerm := s.state.GetCurrentTerm() + 1
+				s.state.SwitchState(newTerm, nil, LEADER)
+				break outerloop
+			case event := <-s.appendEntriesChannel:
+				if event.term >= s.state.GetCurrentTerm() {
+					s.state.SwitchState(event.term, nil, FOLLOWER)
+				}
+			case event := <-s.requestVotesChannel:
+				if event.term >= s.state.GetCurrentTerm() {
+					s.state.SwitchState(event.term, nil, FOLLOWER)
+				}
+				break
+			case <-time.After(electionTimeout):
+				electionTimeout = newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
+				isLeaderChannel = s.SendRequestVoteRPCs()
+			case <-ctx.Done():
+				break outerloop
+			}
+		}
+
+		close(doneChannel)
+	}()
+
+	return doneChannel
+}
+
+func (s *Server) HandleStateLeader(ctx context.Context) <-chan struct{} {
+	doneChannel := make(chan struct{})
+
+	go func() {
+		err := s.SendHeartbeat()
+
+	outerloop:
+		for {
+			select {
+			case <-ctx.Done():
+				break outerloop
+			}
+		}
+
+		close(doneChannel)
+	}()
+
+	return doneChannel
+}
+
+func newElectionTimeout(min time.Duration, max time.Duration) time.Duration {
+	electionTimeoutDiff := max - min
+	electionTimeoutRand := rand.Int63n(electionTimeoutDiff.Nanoseconds())
+	electionTimeoutRandNano := time.Duration(electionTimeoutRand) * time.Nanosecond
+	electionTimeout := max + electionTimeoutRandNano
+
+	return electionTimeout
 }
