@@ -1,4 +1,5 @@
 22.09.2019:
 - validate the code
-- continue implementing BroadcastHeartbat for the leader
-- add proper debug logging
+- think about making it more concurrent, as currently only one request from any type can be pending on a server (because each request needs to access the node's state)
+- pass log as param in cluster
+- buffer channels
