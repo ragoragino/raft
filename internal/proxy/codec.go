@@ -4,9 +4,9 @@ import (
 	"fmt"
 )
 
-type ProxyCodec struct {}
+type ProxyCodec struct{}
 
-func NewProxyCodec() ProxyCodec{
+func NewProxyCodec() ProxyCodec {
 	return ProxyCodec{}
 }
 

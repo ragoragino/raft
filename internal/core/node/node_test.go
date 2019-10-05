@@ -1,37 +1,46 @@
 package node_test
 
 import (
+	"os"
 	node "raft/internal/core/node"
+	"sync"
 	"testing"
-	"time"
 
-	"github.com/stretchr/testify/assert"
 	logrus "github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestServer(t *testing.T) {
+	logrus.SetLevel(logrus.DebugLevel)
+
+	logger := logrus.New()
+	logger.Level = logrus.DebugLevel
+	logger.Out = os.Stdout
+
 	endpoints := map[string]string{
-		"Node0": "127.0.0.1:10000",
-		"Node1": "127.0.0.1:10001",
-		"Node2": "127.0.0.1:10002",
+		"Node0": "localhost:10000",
+		"Node1": "localhost:10001",
+		"Node2": "localhost:10002",
 	}
 
 	clusters := make(map[string]*node.Cluster, len(endpoints))
 	for name := range endpoints {
-		clusters[name] = node.NewCluster()
+		logger := logger.WithFields(logrus.Fields{
+			"node": name,
+		})
+
+		clusters[name] = node.NewCluster(logger)
 	}
 
 	// Start servers
 	servers := make([]*node.Server, 0, len(endpoints))
-	for name := range endpoints {
-		settings := node.Settings{
-			ID: name,
-			HeartbeatFrequency: 250 * time.Millisecond,
-			MaxElectionTimeout: 1000 * time.Millisecond,
-			MinElectionTimeout: 500 * time.Millisecond,
-		}
-	
-		servers = append(servers, node.NewServer(settings, clusters[name], logrus.New()))
+	for name, endpoint := range endpoints {
+		logger := logger.WithFields(logrus.Fields{
+			"node": name,
+		})
+
+		servers = append(servers, node.NewServer(clusters[name], logger,
+			node.WithServerID(name), node.WithEndpoint(endpoint)))
 	}
 
 	// Start clusters
@@ -42,7 +51,7 @@ func TestServer(t *testing.T) {
 				continue
 			}
 			clusterEndpoints[clusterName] = clusterEndpoint
-		  }
+		}
 
 		err := cluster.StartCluster(clusterEndpoints)
 		assert.NoError(t, err)
@@ -50,7 +59,14 @@ func TestServer(t *testing.T) {
 		defer cluster.Close()
 	}
 
+	wg := sync.WaitGroup{}
+	wg.Add(len(servers))
 	for _, server := range servers {
-		server.Run()
+		go func(server *node.Server) {
+			defer wg.Done()
+			server.Run()
+		}(server)
 	}
+
+	wg.Wait()
 }

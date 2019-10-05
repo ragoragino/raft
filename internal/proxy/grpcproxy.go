@@ -25,7 +25,7 @@ type RoutingRulesHandler func(md metadata.MD) (string, error)
 
 type Processor struct {
 	routingRulesHandler RoutingRulesHandler
-	server *grpc.Server
+	server              *grpc.Server
 }
 
 func NewProcessor(routingRulesHandler RoutingRulesHandler) *Processor {
@@ -43,7 +43,7 @@ func NewProcessor(routingRulesHandler RoutingRulesHandler) *Processor {
 }
 
 func (p *Processor) Serve(lis net.Listener) error {
-	return p.server.Serve(lis) 
+	return p.server.Serve(lis)
 }
 
 func (p *Processor) GracefulStop() {
@@ -52,11 +52,11 @@ func (p *Processor) GracefulStop() {
 
 func (p *Processor) Handle(srv interface{}, serverStream grpc.ServerStream) error {
 	ctx := serverStream.Context()
-    md, ok := metadata.FromIncomingContext(ctx)
-    if !ok {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
 		return grpc.Errorf(codes.InvalidArgument, "could not obtain metadata from context")
-    } 
-	
+	}
+
 	address, err := p.routingRulesHandler(md)
 	if err != nil {
 		return grpc.Errorf(codes.Unavailable, err.Error())
@@ -76,9 +76,9 @@ func (p *Processor) Handle(srv interface{}, serverStream grpc.ServerStream) erro
 
 	clientStream, err := grpc.NewClientStream(clientCtx, clientStreamDescForProxying, conn, fullMethodName)
 	if err != nil {
-		return grpc.Errorf(codes.Internal, err.Error()) 
+		return grpc.Errorf(codes.Internal, err.Error())
 	}
-	
+
 	srverErrChan := p.forwardServerToClient(serverStream, clientStream)
 	clientErrChan := p.forwardClientToServer(clientStream, serverStream)
 

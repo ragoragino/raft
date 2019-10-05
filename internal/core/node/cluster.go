@@ -2,21 +2,44 @@ package node
 
 import (
 	"context"
-	logrus "github.com/sirupsen/logrus"
-	pb "raft/internal/core/node/gen"
-	"time"
 	"fmt"
-	"sync"
+	logrus "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	pb "raft/internal/core/node/gen"
+	"sync"
+	"time"
 )
 
-const (
-	defaultRPCTimeout time.Duration = 5 * time.Second
+type clusterOptions struct {
+	defaultRPCRequestTimeout time.Duration
+}
+
+var (
+	defaultClusterOptions = clusterOptions{
+		defaultRPCRequestTimeout: 5 * time.Second,
+	}
 )
+
+type ClusterCallOption func(opt *clusterOptions)
+
+func WithDefaultRPCRequestTimeout(timeout time.Duration) ClusterCallOption {
+	return func(opt *clusterOptions) {
+		opt.defaultRPCRequestTimeout = timeout
+	}
+}
+
+func applyClusterOptions(opts []ClusterCallOption) *clusterOptions {
+	options := defaultClusterOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	return &options
+}
 
 type ClusterState struct {
-	numberOfNodes int
-	leaderName string
+	numberOfNodes  int
+	leaderName     string
 	leaderEndpoint string
 }
 
@@ -25,26 +48,31 @@ type ICluster interface {
 	Close()
 
 	GetClusterState() ClusterState
-	SetLeader(leaderName string) error 
-	BroadcastRequestVoteRPCs(ctx context.Context, request *pb.RequestVoteRequest) []*pb.RequestVoteResponse 
+	SetLeader(leaderName string) error
+	BroadcastRequestVoteRPCs(ctx context.Context, request *pb.RequestVoteRequest) []*pb.RequestVoteResponse
 	BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.AppendEntriesRequest) []*pb.AppendEntriesResponse
 }
 
 type NodeInfo struct {
-	name string
-	endpoint string
+	name       string
+	endpoint   string
 	connection grpc.ClientConn
-	client pb.NodeClient
+	client     pb.NodeClient
 }
 
 type Cluster struct {
-	nodes []*NodeInfo
-	leader *NodeInfo
+	logger      *logrus.Entry
+	nodes       []*NodeInfo
+	leader      *NodeInfo
 	leaderMutex sync.RWMutex
+	settings    *clusterOptions
 }
 
-func NewCluster() *Cluster {
-	return &Cluster{}
+func NewCluster(logger *logrus.Entry, opts ...ClusterCallOption) *Cluster {
+	return &Cluster{
+		logger:   logger,
+		settings: applyClusterOptions(opts),
+	}
 }
 
 func (c *Cluster) StartCluster(otherNodes map[string]string) error {
@@ -55,26 +83,26 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 	nodes := make([]*NodeInfo, 0, len(otherNodes))
 
 	for name, endpoint := range otherNodes {
-		conn, err := grpc.Dial(endpoint, grpc.WithInsecure(), grpc.WithAuthority(endpoint), 
-			grpc.WithBackoffMaxDelay(1 * time.Second))
+		conn, err := grpc.Dial(endpoint, grpc.WithInsecure(), grpc.WithAuthority(endpoint),
+			grpc.WithBackoffMaxDelay(1*time.Second))
 		if err != nil {
 			for _, node := range nodes {
 				err := node.connection.Close()
 				if err != nil {
-					logrus.Errorf("unable to close a connection for node: %s: %+v", node.name, err)
+					c.logger.Errorf("unable to close a connection for node: %s: %+v", node.name, err)
 				}
 			}
 
-			return fmt.Errorf("unable to make gRPC dial: %+v", err)
+			return fmt.Errorf("unable to make a gRPC dial: %+v", err)
 		}
 
 		client := pb.NewNodeClient(conn)
 
 		nodes = append(nodes, &NodeInfo{
-			name: name,
+			name:     name,
 			endpoint: endpoint,
-			client: client,
-		}) 
+			client:   client,
+		})
 	}
 
 	c.nodes = nodes
@@ -105,8 +133,8 @@ func (c *Cluster) GetClusterState() ClusterState {
 	}
 
 	return ClusterState{
-		numberOfNodes: len(c.nodes),
-		leaderName: leaderName,
+		numberOfNodes:  len(c.nodes),
+		leaderName:     leaderName,
 		leaderEndpoint: leaderEndpoint,
 	}
 }
@@ -114,7 +142,7 @@ func (c *Cluster) GetClusterState() ClusterState {
 func (c *Cluster) SetLeader(leaderName string) error {
 	for _, node := range c.nodes {
 		if node.name == leaderName {
-			c.leaderMutex.Lock()			
+			c.leaderMutex.Lock()
 			c.leader = node
 			c.leaderMutex.Unlock()
 			return nil
@@ -126,29 +154,29 @@ func (c *Cluster) SetLeader(leaderName string) error {
 
 func (c *Cluster) BroadcastRequestVoteRPCs(ctx context.Context, request *pb.RequestVoteRequest) []*pb.RequestVoteResponse {
 	responses := make([]*pb.RequestVoteResponse, 0, len(c.nodes))
-	responseChannel := make(chan *pb.RequestVoteResponse)
+	responseChannel := make(chan *pb.RequestVoteResponse, len(c.nodes))
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(c.nodes))
 
-	ctx, cancel := context.WithTimeout(ctx, defaultRPCTimeout)
+	ctx, cancel := context.WithTimeout(ctx, c.settings.defaultRPCRequestTimeout)
 	defer cancel()
 	for _, node := range c.nodes {
-		go func() {
+		go func(node *NodeInfo) {
 			defer wg.Done()
 
-			logrus.Debugf("sending RPC RequestVote to client: %s", node.name)
+			c.logger.Debugf("sending RPC RequestVote to client: %s", node.name)
 
 			resp, err := node.client.RequestVote(ctx, request)
 			if err != nil {
-				logrus.Errorf("unable to RPC RequestVote to client %s because: %+v", node.name, err)
+				c.logger.Errorf("unable to RPC RequestVote to client %s because: %+v", node.name, err)
 				return
 			}
 
-			logrus.Debugf("received response from RPC RequestVote %+v from client: %s", resp, node.name)
+			c.logger.Debugf("received response from RPC RequestVote %+v from client: %s", resp, node.name)
 
 			responseChannel <- resp
-		}()
+		}(node)
 	}
 
 	wg.Wait()
@@ -163,29 +191,29 @@ func (c *Cluster) BroadcastRequestVoteRPCs(ctx context.Context, request *pb.Requ
 
 func (c *Cluster) BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.AppendEntriesRequest) []*pb.AppendEntriesResponse {
 	responses := make([]*pb.AppendEntriesResponse, 0, len(c.nodes))
-	responseChannel := make(chan *pb.AppendEntriesResponse)
+	responseChannel := make(chan *pb.AppendEntriesResponse, len(c.nodes))
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(c.nodes))
 
-	ctx, cancel := context.WithTimeout(ctx, defaultRPCTimeout)
+	ctx, cancel := context.WithTimeout(ctx, c.settings.defaultRPCRequestTimeout)
 	defer cancel()
 	for _, node := range c.nodes {
-		go func() {
+		go func(node *NodeInfo) {
 			defer wg.Done()
 
-			logrus.Debugf("sending RPC AppendEntries to client: %s", node.name)
+			c.logger.Debugf("sending RPC AppendEntries to client: %s", node.name)
 
 			resp, err := node.client.AppendEntries(ctx, request)
 			if err != nil {
-				logrus.Errorf("unable to RPC AppendEntries to client %+v because: %+v", node.name, err)
+				c.logger.Errorf("unable to RPC AppendEntries to client %+v because: %+v", node.name, err)
 				return
 			}
 
-			logrus.Debugf("received response from RPC AppendEntries %+v from client: %s", resp, node.name)
+			c.logger.Debugf("received response from RPC AppendEntries %+v from client: %s", resp, node.name)
 
 			responseChannel <- resp
-		}()
+		}(node)
 	}
 
 	wg.Wait()
@@ -197,5 +225,3 @@ func (c *Cluster) BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.Ap
 
 	return responses
 }
-
-

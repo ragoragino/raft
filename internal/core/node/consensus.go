@@ -5,13 +5,13 @@ package node
 import (
 	"context"
 	logrus "github.com/sirupsen/logrus"
-	"math/rand"
 	"math"
+	"math/rand"
+	"net"
+	"net/http"
 	pb "raft/internal/core/node/gen"
 	"sync"
 	"time"
-	"net/http"
-	"net"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -19,12 +19,63 @@ import (
 
 type ServerRole int
 
-type Settings struct {
-	ID string
-	Endpoint string
+type serverOptions struct {
+	ID                 string
+	Endpoint           string
 	HeartbeatFrequency time.Duration
 	MaxElectionTimeout time.Duration
 	MinElectionTimeout time.Duration
+}
+
+var (
+	defaultServerOptions = serverOptions{
+		ID:                 "Node",
+		Endpoint:           "localhost:10000",
+		HeartbeatFrequency: 500 * time.Millisecond,
+		MaxElectionTimeout: 1000 * time.Millisecond,
+		MinElectionTimeout: 750 * time.Millisecond,
+	}
+)
+
+type ServerCallOption func(opt *serverOptions)
+
+func WithServerID(id string) ServerCallOption {
+	return func(opt *serverOptions) {
+		opt.ID = id
+	}
+}
+
+func WithEndpoint(endpoint string) ServerCallOption {
+	return func(opt *serverOptions) {
+		opt.Endpoint = endpoint
+	}
+}
+
+func WithHeartbeatFrequency(freq time.Duration) ServerCallOption {
+	return func(opt *serverOptions) {
+		opt.HeartbeatFrequency = freq
+	}
+}
+
+func WithMaxElectionTimeout(timeout time.Duration) ServerCallOption {
+	return func(opt *serverOptions) {
+		opt.MaxElectionTimeout = timeout
+	}
+}
+
+func WithMinElectionTimeout(timeout time.Duration) ServerCallOption {
+	return func(opt *serverOptions) {
+		opt.MinElectionTimeout = timeout
+	}
+}
+
+func applyServerOptions(opts []ServerCallOption) *serverOptions {
+	options := defaultServerOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	return &options
 }
 
 const (
@@ -38,19 +89,19 @@ type LogEntry struct {
 	Term    int64
 }
 
-type stateInfo struct {
+type StateInfo struct {
 	CurrentTerm int64
 	VotedFor    *string
 	Role        ServerRole
 }
 
 type StateSwitched struct {
-	oldState stateInfo
-	newState stateInfo
+	oldState StateInfo
+	newState StateInfo
 }
 
 type State struct {
-	info stateInfo
+	info StateInfo
 	Log  []LogEntry
 
 	handlers map[string]chan StateSwitched
@@ -58,12 +109,12 @@ type State struct {
 
 func NewState(currentTerm int64, votedFor *string, role ServerRole) *State {
 	return &State{
-		info: stateInfo{
+		info: StateInfo{
 			CurrentTerm: currentTerm,
 			VotedFor:    votedFor,
 			Role:        role,
 		},
-		handlers: make(map[string] chan StateSwitched),
+		handlers: make(map[string]chan StateSwitched),
 	}
 }
 
@@ -102,6 +153,12 @@ func (s *State) GetLastLogIndex() int64 {
 }
 
 func (s *State) GetLastLogTerm() int64 {
+	logLength := len(s.Log)
+	if logLength == 0 {
+		// TODO
+		return 1
+	}
+
 	return s.Log[len(s.Log)-1].Term
 }
 
@@ -128,7 +185,7 @@ type requestVoteEvent struct {
 }
 
 type Server struct {
-	settings   Settings
+	settings   *serverOptions
 	cluster    ICluster
 	state      *State
 	stateMutex sync.RWMutex
@@ -138,18 +195,16 @@ type Server struct {
 	requestVotesChannel  chan requestVoteEvent
 }
 
-func NewServer(settings Settings, cluster ICluster, logger *logrus.Logger) *Server {
+func NewServer(cluster ICluster, logger *logrus.Entry, opts ...ServerCallOption) *Server {
 	server := &Server{
-		settings: settings,
-		cluster: cluster,
-		logger: logrus.New().WithFields(logrus.Fields{
-			"node": settings.ID,
-		  }),
+		settings:             applyServerOptions(opts),
+		cluster:              cluster,
+		logger:               logger,
 		appendEntriesChannel: make(chan appendEntriesEvent),
-		requestVotesChannel: make(chan requestVoteEvent),
+		requestVotesChannel:  make(chan requestVoteEvent),
 	}
 
-	lis, err := net.Listen("tcp", settings.Endpoint)
+	lis, err := net.Listen("tcp", server.settings.Endpoint)
 	if err != nil {
 		server.logger.Panicf("failed to listen: %+v", err)
 	}
@@ -188,7 +243,7 @@ func (s *Server) AppendEntries(ctx context.Context, request *pb.AppendEntriesReq
 		// The candidate has lower term than the node, so deny the request
 		logger.Debugf("sending reject response. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
 		return &pb.AppendEntriesResponse{
-			Term:        receiverTerm,
+			Term:    receiverTerm,
 			Success: false,
 		}, nil
 	} else {
@@ -210,7 +265,7 @@ func (s *Server) AppendEntries(ctx context.Context, request *pb.AppendEntriesReq
 	logger.Debugf("sending accept response")
 
 	return &pb.AppendEntriesResponse{
-		Term: receiverTerm,
+		Term:    receiverTerm,
 		Success: true,
 	}, nil
 }
@@ -222,7 +277,7 @@ func (s *Server) RequestVote(ctx context.Context, request *pb.RequestVoteRequest
 
 	voteGranted := false
 	defer func() {
-			s.requestVotesChannel <- requestVoteEvent{
+		s.requestVotesChannel <- requestVoteEvent{
 			voteGranted: voteGranted,
 		}
 	}()
@@ -263,7 +318,7 @@ func (s *Server) RequestVote(ctx context.Context, request *pb.RequestVoteRequest
 	voteGranted = true
 
 	return &pb.RequestVoteResponse{
-		Term: receiverTerm,
+		Term:        receiverTerm,
 		VoteGranted: voteGranted,
 	}, nil
 }
@@ -352,6 +407,23 @@ func (s *Server) HandleRoleFollower(ctx context.Context, stateChangedChannel <-c
 	go func() {
 		electionTimeout := newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
 
+		electionTimedChannel := make(chan struct{})
+		go func() {
+			select {
+			case <-electionTimedChannel:
+				s.stateMutex.Lock()
+
+				s.logger.Debugf("election timed out, therefore switching to CANDIDATE role")
+
+				newTerm := s.state.GetCurrentTerm() + 1
+				votedFor := s.settings.ID
+				s.state.SwitchState(newTerm, &votedFor, CANDIDATE)
+
+				s.stateMutex.Unlock()
+			case <-ctx.Done():
+			}
+		}()
+
 	outerloop:
 		for {
 			select {
@@ -369,17 +441,7 @@ func (s *Server) HandleRoleFollower(ctx context.Context, stateChangedChannel <-c
 					electionTimeout = newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
 				}
 			case <-time.After(electionTimeout):
-				s.stateMutex.Lock()
-
-				s.logger.Debugf("election timed out, therefore switching to CANDIDATE role")
-
-				newTerm := s.state.GetCurrentTerm() + 1
-				votedFor := s.settings.ID
-				s.state.SwitchState(newTerm, &votedFor, CANDIDATE)
-
-				s.stateMutex.Unlock()
-
-				break outerloop
+				close(electionTimedChannel)
 			case <-ctx.Done():
 				break outerloop
 			}
@@ -411,12 +473,14 @@ func (s *Server) HandleRoleCandidate(ctx context.Context, stateChangedChannel <-
 
 		electionTimeout := newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
 
-		ctx, cancel := context.WithTimeout(context.Background(), s.settings.MinElectionTimeout)	
-		go s.broadcastRequestVote(ctx)
+		innerCtx, cancel := context.WithTimeout(context.Background(), s.settings.MinElectionTimeout)
+		go s.broadcastRequestVote(innerCtx)
 
 	outerloop:
 		for {
 			select {
+			case <-s.appendEntriesChannel:
+			case <-s.requestVotesChannel:
 			case <-stateChangedChannel:
 				// No need to check what is the new state
 				// because candidate can only result from the FOLLOWER state handler
@@ -428,8 +492,8 @@ func (s *Server) HandleRoleCandidate(ctx context.Context, stateChangedChannel <-
 
 				s.logger.Debugf("election timed out without a winner, broadcasting new vote")
 
-				ctx, cancel = context.WithTimeout(context.Background(), s.settings.MinElectionTimeout)	
-				go s.broadcastRequestVote(ctx)
+				innerCtx, cancel = context.WithTimeout(context.Background(), s.settings.MinElectionTimeout)
+				go s.broadcastRequestVote(innerCtx)
 			case <-ctx.Done():
 				cancel()
 				break outerloop
@@ -460,7 +524,7 @@ func (s *Server) broadcastRequestVote(ctx context.Context) {
 		return
 	default:
 	}
-	
+
 	// Count of votes starts at one because the server always votes for itself
 	countOfVotes := 1
 	s.stateMutex.RLock()
@@ -479,7 +543,7 @@ func (s *Server) broadcastRequestVote(ctx context.Context) {
 			return
 		}
 
-		if response.GetVoteGranted(){
+		if response.GetVoteGranted() {
 			countOfVotes++
 		}
 	}
@@ -502,10 +566,12 @@ func (s *Server) HandleRoleLeader(ctx context.Context, stateChangedChannel <-cha
 	doneChannel := make(chan struct{})
 
 	go func() {
-	// Firstly, check if the state hasn't been changed in the meantime
+		// Firstly, check if the state hasn't been changed in the meantime
 	stateChangedLoop:
 		for {
 			select {
+			case <-s.appendEntriesChannel:
+			case <-s.requestVotesChannel:
 			case <-stateChangedChannel:
 				// No need to check what is the new state
 				// because leader can only result from the CANDIDATE state handler
@@ -516,8 +582,8 @@ func (s *Server) HandleRoleLeader(ctx context.Context, stateChangedChannel <-cha
 			}
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), s.settings.MinElectionTimeout)	
-		go s.broadcastHeartbeat(ctx)
+		innerCtx, cancel := context.WithTimeout(context.Background(), s.settings.MinElectionTimeout)
+		go s.broadcastHeartbeat(innerCtx)
 
 	outerloop:
 		for {
@@ -532,8 +598,8 @@ func (s *Server) HandleRoleLeader(ctx context.Context, stateChangedChannel <-cha
 
 				s.logger.Debugf("sending new heartbeat")
 
-				ctx, cancel = context.WithTimeout(context.Background(), s.settings.HeartbeatFrequency)	
-				go s.broadcastHeartbeat(ctx)
+				innerCtx, cancel = context.WithTimeout(context.Background(), s.settings.HeartbeatFrequency)
+				go s.broadcastHeartbeat(innerCtx)
 			case <-ctx.Done():
 				cancel()
 				break outerloop
@@ -549,9 +615,9 @@ func (s *Server) HandleRoleLeader(ctx context.Context, stateChangedChannel <-cha
 func (s *Server) broadcastHeartbeat(ctx context.Context) {
 	s.stateMutex.RLock()
 	request := &pb.AppendEntriesRequest{
-		Term:         s.state.GetCurrentTerm(),
-		LeaderId:  s.settings.ID,
-		Entries: make([]*pb.AppendEntriesRequest_Entry, 0),
+		Term:     s.state.GetCurrentTerm(),
+		LeaderId: s.settings.ID,
+		Entries:  make([]*pb.AppendEntriesRequest_Entry, 0),
 	}
 	s.stateMutex.RUnlock()
 
@@ -563,7 +629,7 @@ func (s *Server) broadcastHeartbeat(ctx context.Context) {
 		return
 	default:
 	}
-	
+
 	// Check if the response contains higher term, so that we convert to follower
 	s.stateMutex.Lock()
 	if s.state.GetRole() != LEADER {
