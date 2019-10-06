@@ -1,3 +1,3 @@
-05.10.2019:
-- validate the logic in consensus
+06.10.2019:
+- write to persisentent storage
 - make some tests for election handling
