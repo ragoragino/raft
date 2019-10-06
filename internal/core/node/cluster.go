@@ -56,7 +56,7 @@ type ICluster interface {
 type NodeInfo struct {
 	name       string
 	endpoint   string
-	connection grpc.ClientConn
+	connection *grpc.ClientConn
 	client     pb.NodeClient
 }
 
@@ -66,6 +66,8 @@ type Cluster struct {
 	leader      *NodeInfo
 	leaderMutex sync.RWMutex
 	settings    *clusterOptions
+
+	closeOnce sync.Once
 }
 
 func NewCluster(logger *logrus.Entry, opts ...ClusterCallOption) *Cluster {
@@ -84,7 +86,7 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 
 	for name, endpoint := range otherNodes {
 		conn, err := grpc.Dial(endpoint, grpc.WithInsecure(), grpc.WithAuthority(endpoint),
-			grpc.WithBackoffMaxDelay(1*time.Second))
+			grpc.WithBlock())
 		if err != nil {
 			for _, node := range nodes {
 				err := node.connection.Close()
@@ -96,12 +98,11 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 			return fmt.Errorf("unable to make a gRPC dial: %+v", err)
 		}
 
-		client := pb.NewNodeClient(conn)
-
 		nodes = append(nodes, &NodeInfo{
-			name:     name,
-			endpoint: endpoint,
-			client:   client,
+			name:       name,
+			endpoint:   endpoint,
+			connection: conn,
+			client:     pb.NewNodeClient(conn),
 		})
 	}
 
@@ -111,12 +112,16 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 }
 
 func (c *Cluster) Close() {
-	for _, node := range c.nodes {
-		err := node.connection.Close()
-		if err != nil {
-			logrus.Errorf("unable to close a connection for node: %s: %+v", node.name, err)
+	c.closeOnce.Do(func() {
+		c.logger.Errorf("closing cluster connections")
+
+		for _, node := range c.nodes {
+			err := node.connection.Close()
+			if err != nil {
+				logrus.Errorf("unable to close a connection for node: %s: %+v", node.name, err)
+			}
 		}
-	}
+	})
 }
 
 func (c *Cluster) GetClusterState() ClusterState {
@@ -149,7 +154,7 @@ func (c *Cluster) SetLeader(leaderName string) error {
 		}
 	}
 
-	return fmt.Errorf("leader with this name was not found in the list of nodes")
+	return fmt.Errorf("leader with this name was not found in the list of nodes: %s", leaderName)
 }
 
 func (c *Cluster) BroadcastRequestVoteRPCs(ctx context.Context, request *pb.RequestVoteRequest) []*pb.RequestVoteResponse {

@@ -4,6 +4,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 	logrus "github.com/sirupsen/logrus"
 	"math"
 	"math/rand"
@@ -15,8 +16,6 @@ import (
 
 	"google.golang.org/grpc"
 )
-
-type ServerRole int
 
 type serverOptions struct {
 	ID                 string
@@ -77,11 +76,26 @@ func applyServerOptions(opts []ServerCallOption) *serverOptions {
 	return &options
 }
 
+type ServerRole int
+
 const (
 	FOLLOWER ServerRole = iota
 	CANDIDATE
 	LEADER
 )
+
+func (s ServerRole) String() string {
+	switch s {
+	case FOLLOWER:
+		return "FOLLOWER"
+	case CANDIDATE:
+		return "CANDIDATE"
+	case LEADER:
+		return "LEADER"
+	default:
+		return fmt.Sprintf("%d", int(s))
+	}
+}
 
 type appendEntriesEvent struct {
 	byLeader bool
@@ -92,11 +106,14 @@ type requestVoteEvent struct {
 }
 
 type Server struct {
-	settings   *serverOptions
-	cluster    ICluster
-	state      *State
-	stateMutex sync.RWMutex
-	logger     *logrus.Entry
+	settings     *serverOptions
+	cluster      ICluster
+	state        *State
+	stateMutex   sync.RWMutex
+	logger       *logrus.Entry
+	closeChannel chan struct{}
+	closeOnce    sync.Once
+	grpcServer   *grpc.Server
 
 	appendEntriesChannel chan appendEntriesEvent
 	requestVotesChannel  chan requestVoteEvent
@@ -107,6 +124,7 @@ func NewServer(cluster ICluster, logger *logrus.Entry, opts ...ServerCallOption)
 		settings:             applyServerOptions(opts),
 		cluster:              cluster,
 		logger:               logger,
+		closeChannel:         make(chan struct{}),
 		appendEntriesChannel: make(chan appendEntriesEvent),
 		requestVotesChannel:  make(chan requestVoteEvent),
 	}
@@ -123,6 +141,8 @@ func NewServer(cluster ICluster, logger *logrus.Entry, opts ...ServerCallOption)
 			server.logger.Panicf("failed to serve: %v", err)
 		}
 	}()
+
+	server.grpcServer = grpcServer
 
 	return server
 }
@@ -165,15 +185,14 @@ func (s *Server) AppendEntries(ctx context.Context, request *pb.AppendEntriesReq
 		}
 	}
 
-	// TODO: Handle all other cases
-
-	// Check if it is a heartbeat from the leader
-	if len(request.Entries) == 0 {
-		err := s.cluster.SetLeader(request.GetLeaderId())
-		if err != nil {
-			logger.Errorf("unable to set leader: %+v", err)
-		}
+	// Set the leader
+	err := s.cluster.SetLeader(request.GetLeaderId())
+	if err != nil {
+		logger.Errorf("unable to set leader: %+v", err)
 	}
+
+	// TODO: Handle all other cases
+	// TODO: Check if it is a heartbeat from the leader
 
 	logger.Debugf("sending accept response")
 
@@ -291,8 +310,14 @@ func (s *Server) Run() {
 
 	for {
 		// Waiting for the definitive end of the previous state
-		newRole := <-doneChannel
-		cancel()
+		var newRole ServerRole
+		select {
+		case newRole = <-doneChannel:
+			cancel()
+		case <-s.closeChannel:
+			cancel()
+			return
+		}
 
 		s.logger.Debugf("handler for old role finished. New role: %+v", newRole)
 
@@ -308,6 +333,16 @@ func (s *Server) Run() {
 			s.logger.Panicf("unrecognized role: %+v", newRole)
 		}
 	}
+}
+
+func (s *Server) Close() {
+	s.logger.Debugf("closing server")
+
+	s.grpcServer.GracefulStop()
+
+	s.closeOnce.Do(func() {
+		close(s.closeChannel)
+	})
 }
 
 func (s *Server) HandleRoleFollower(ctx context.Context, stateChangedChannel <-chan StateSwitched) <-chan ServerRole {
@@ -434,13 +469,6 @@ func (s *Server) broadcastRequestVote(ctx context.Context) {
 
 	responses := s.cluster.BroadcastRequestVoteRPCs(ctx, request)
 
-	// Check if the context hasn't been cancelled
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
-
 	// Count of votes starts at one because the server always votes for itself
 	countOfVotes := 1
 	s.stateMutex.Lock()
@@ -538,13 +566,6 @@ func (s *Server) broadcastHeartbeat(ctx context.Context) {
 	s.stateMutex.RUnlock()
 
 	responses := s.cluster.BroadcastAppendEntriesRPCs(ctx, request)
-
-	// Check if the context hasn't been cancelled
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
 
 	// Check if the response contains higher term, so that we convert to follower
 	s.stateMutex.Lock()
