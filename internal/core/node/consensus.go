@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	pb "raft/internal/core/node/gen"
+	"raft/internal/core/persister"
 	"sync"
 	"time"
 
@@ -119,7 +120,8 @@ type Server struct {
 	requestVotesChannel  chan requestVoteEvent
 }
 
-func NewServer(cluster ICluster, logger *logrus.Entry, opts ...ServerCallOption) *Server {
+func NewServer(cluster ICluster, logger *logrus.Entry, statePersister *persister.FileStateLogger,
+	opts ...ServerCallOption) *Server {
 	server := &Server{
 		settings:             applyServerOptions(opts),
 		cluster:              cluster,
@@ -143,6 +145,12 @@ func NewServer(cluster ICluster, logger *logrus.Entry, opts ...ServerCallOption)
 	}()
 
 	server.grpcServer = grpcServer
+
+	server.state = NewState(StateInfo{
+		CurrentTerm: 0,
+		VotedFor:    nil,
+		Role:        FOLLOWER,
+	}, statePersister)
 
 	return server
 }
@@ -296,8 +304,6 @@ func (s *Server) Find(ctx context.Context, in *pb.FindRequest) (*pb.FindResponse
 }
 
 func (s *Server) Run() {
-	s.state = NewState(0, nil, FOLLOWER)
-
 	stateChangedChannel := make(chan StateSwitched)
 	id := s.state.AddStateHandler(stateChangedChannel)
 	defer func() {

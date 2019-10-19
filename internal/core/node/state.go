@@ -3,6 +3,7 @@ package node
 import (
 	"github.com/google/uuid"
 	logrus "github.com/sirupsen/logrus"
+	"raft/internal/core/persister"
 )
 
 type LogEntry struct {
@@ -25,17 +26,21 @@ type State struct {
 	info StateInfo
 	Log  []LogEntry
 
+	statePersister *persister.FileStateLogger
+
 	handlers map[string]chan StateSwitched
 }
 
-func NewState(currentTerm int64, votedFor *string, role ServerRole) *State {
+func NewState(stateInfo StateInfo, statePersister *persister.FileStateLogger) *State {
+	statePersister.UpdateState(&persister.State{
+		VotedFor:    stateInfo.VotedFor,
+		CurrentTerm: stateInfo.CurrentTerm,
+	})
+
 	return &State{
-		info: StateInfo{
-			CurrentTerm: currentTerm,
-			VotedFor:    votedFor,
-			Role:        role,
-		},
-		handlers: make(map[string]chan StateSwitched),
+		info:           stateInfo,
+		statePersister: statePersister,
+		handlers:       make(map[string]chan StateSwitched),
 	}
 }
 
@@ -57,11 +62,11 @@ func (s *State) RemoveStateHandler(id string) {
 }
 
 func (s *State) GetCurrentTerm() int64 {
-	return s.info.CurrentTerm
+	return s.statePersister.GetState().CurrentTerm
 }
 
 func (s *State) GetVotedFor() *string {
-	return s.info.VotedFor
+	return s.statePersister.GetState().VotedFor
 }
 
 func (s *State) GetRole() ServerRole {
@@ -86,8 +91,11 @@ func (s *State) GetLastLogTerm() int64 {
 func (s *State) SwitchState(term int64, votedFor *string, role ServerRole) {
 	oldInfo := s.info
 
-	s.info.CurrentTerm = term
-	s.info.VotedFor = votedFor
+	s.statePersister.UpdateState(&persister.State{
+		VotedFor:    votedFor,
+		CurrentTerm: term,
+	})
+
 	s.info.Role = role
 
 	for _, handler := range s.handlers {
