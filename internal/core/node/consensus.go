@@ -120,7 +120,7 @@ type Server struct {
 	requestVotesChannel  chan requestVoteEvent
 }
 
-func NewServer(cluster ICluster, logger *logrus.Entry, statePersister persister.StateLogger,
+func NewServer(cluster ICluster, logger *logrus.Entry, statePersister persister.IStateLogger,
 	opts ...ServerCallOption) *Server {
 	server := &Server{
 		settings:             applyServerOptions(opts),

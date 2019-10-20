@@ -15,7 +15,7 @@ func TestFileStateLogger(t *testing.T) {
 
 	defer func() {
 		err := os.RemoveAll(fileStatePath)
-		assert.NoError(t, err)	
+		assert.NoError(t, err)
 	}()
 
 	loggerEntry := logger.WithFields(logrus.Fields{

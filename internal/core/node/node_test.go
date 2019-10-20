@@ -14,7 +14,7 @@ import (
 	"raft/internal/core/persister"
 )
 
-func initializeStatePersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (persister.StateLogger, func()) {
+func initializeStatePersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (persister.IStateLogger, func()) {
 	fileStateLogger := persister.NewLevelDBStateLogger(logger.WithFields(logrus.Fields{
 		"name": "FileStateLogger",
 	}), fileStatePath)

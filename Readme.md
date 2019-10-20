@@ -1,3 +1,3 @@
-06.10.2019:
-- write state and logs to persisentent storage
-- finalize the test with election handling in a situation of network partition
+20.10.2019:
+- finish writing logs to persisentent storage and write unit tests
+- implement AppendEntries RPC logic

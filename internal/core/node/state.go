@@ -26,12 +26,12 @@ type State struct {
 	info StateInfo
 	Log  []LogEntry
 
-	statePersister persister.StateLogger
+	statePersister persister.IStateLogger
 
 	handlers map[string]chan StateSwitched
 }
 
-func NewState(stateInfo StateInfo, statePersister persister.StateLogger) *State {
+func NewState(stateInfo StateInfo, statePersister persister.IStateLogger) *State {
 	statePersister.UpdateState(&persister.State{
 		VotedFor:    stateInfo.VotedFor,
 		CurrentTerm: stateInfo.CurrentTerm,

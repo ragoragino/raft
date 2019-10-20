@@ -17,7 +17,7 @@ type State struct {
 	VotedFor    *string `json:"VotedFor"`
 }
 
-type StateLogger interface {
+type IStateLogger interface {
 	UpdateState(state *State) error
 	GetState() *State
 	Close()
