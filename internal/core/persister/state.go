@@ -3,119 +3,90 @@ package persister
 import (
 	"encoding/json"
 	logrus "github.com/sirupsen/logrus"
-	"io"
-	"os"
-	"strings"
+	"github.com/syndtr/goleveldb/leveldb"
+	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"sync"
 )
 
+var (
+	stateDbKey = "state"
+)
+
 type State struct {
-	CurrentTerm int64     `json:"CurrentTerm"`
+	CurrentTerm int64   `json:"CurrentTerm"`
 	VotedFor    *string `json:"VotedFor"`
 }
 
 type StateLogger interface {
-	UpdateState(state *State)
+	UpdateState(state *State) error
 	GetState() *State
 	Close()
 }
 
-type FileStateLogger struct {
-	file       *os.File
+type LevelDBStateLogger struct {
+	db         *leveldb.DB
 	state      *State
 	logger     *logrus.Entry
 	stateMutex sync.RWMutex
 }
 
-func NewFileStateLogger(logger *logrus.Entry, path string) *FileStateLogger {
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		logger.Panicf("%+v", err)
+func NewLevelDBStateLogger(logger *logrus.Entry, path string) *LevelDBStateLogger {
+	db, err := leveldb.OpenFile(path, nil)
+	if leveldb_errors.IsCorrupted(err) {
+		var err error
+		db, err = leveldb.RecoverFile(path, nil)
+		if err != nil {
+			logger.Panicf("LevelDB could not recover file: %+v", err)
+		}
+	} else if err != nil {
+		logger.Panicf("LevelDB could not open file: %+v", err)
 	}
 
 	var state *State
-
-	fileStat, err := os.Stat(path)
-	if fileStat.Size() != 0 {
-		// In case the file is not empty, find the last JSON string delimited by \n
-		var readStart int64
-		var expectedLineSize int64 = 100
-		var unmarshalledState State
-
-		for {
-			if fileStat.Size() < expectedLineSize {
-				readStart = 0
-			} else {
-				readStart = fileStat.Size() - expectedLineSize
-			}
-
-			buffer := make([]byte, expectedLineSize)
-
-			// Read the batch of file and only panic if the error is not EOF
-			n, err := file.ReadAt(buffer, readStart)
-			if err != nil && err != io.EOF {
-				logger.Panicf("%+v", err)
-			}
-
-			// Try to split the read buffer and panic if there is no element
-			// and we have already read the whole file
-			jsonSlice := strings.Split(string(buffer[:n]), "\n")
-			if len(jsonSlice) == 0 && readStart == 0 {
-				logger.Panicf("no valid state in the file at: %s", path)
-			}
-
-			// We have found the json and we try to unmarshal it to State struct
-			// strings.Split always adds an empty element if the splitting string comes at the end,
-			// therefore we do not take the last element of the slice, but one before that
-			err = json.Unmarshal([]byte(jsonSlice[len(jsonSlice)-2]), &unmarshalledState)
-			if err == nil {
-				state = &unmarshalledState
-				break
-			}
-
-			// If unmarshalling failed, we try to read a larger buffer from the file
-			expectedLineSize *= 2
+	data, err := db.Get([]byte(stateDbKey), nil)
+	if err != nil && err != leveldb_errors.ErrNotFound {
+		logger.Panicf("LevelDB getting state failed: %+v", err)
+	} else if err == nil {
+		state = &State{}
+		err := json.Unmarshal(data, state)
+		if err != nil {
+			logger.Panicf("LevelDB getting state failed: %+v", err)
 		}
 	}
 
-	return &FileStateLogger{
-		file:   file,
+	return &LevelDBStateLogger{
+		db:     db,
 		state:  state,
 		logger: logger,
 	}
 }
 
-func (f *FileStateLogger) UpdateState(state *State) error {
+func (l *LevelDBStateLogger) UpdateState(state *State) error {
 	marshalledState, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
 
-	// Delimit the buffer with '\n'
-	marshalledDelimitedState := make([]byte, len(marshalledState)+1)
-	copy(marshalledDelimitedState, marshalledState)
-	marshalledDelimitedState[len(marshalledState)] = '\n'
-
 	// Update state on a persistent disk
-	_, err = f.file.Write(marshalledDelimitedState)
+	err = l.db.Put([]byte(stateDbKey), marshalledState, nil)
 	if err != nil {
 		return err
 	}
 
 	// Update state in-memory
-	f.stateMutex.Lock()
-	f.state = state
-	f.stateMutex.Unlock()
+	l.stateMutex.Lock()
+	l.state = state
+	l.stateMutex.Unlock()
 
 	return nil
 }
 
-func (f *FileStateLogger) GetState() *State {
-	f.stateMutex.RLock()
-	defer f.stateMutex.RUnlock()
-	return f.state
+func (l *LevelDBStateLogger) GetState() *State {
+	l.stateMutex.RLock()
+	defer l.stateMutex.RUnlock()
+	return l.state
 }
 
-func (f *FileStateLogger) Close() {
-	f.file.Close()
+func (l *LevelDBStateLogger) Close() {
+	l.db.Close()
 }

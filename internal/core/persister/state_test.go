@@ -3,7 +3,6 @@ package persister
 import (
 	logrus "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
-	"io/ioutil"
 	"os"
 	"testing"
 )
@@ -11,22 +10,19 @@ import (
 func TestFileStateLogger(t *testing.T) {
 	logger := logrus.StandardLogger()
 
-	fileStatePath := `./state.txt`
+	fileStatePath := `./db_state_test_TestFileStateLogger`
+	os.RemoveAll(fileStatePath)
+
 	defer func() {
-		f, err := ioutil.ReadFile(fileStatePath)
-		assert.NoError(t, err)
-
-		logger.Printf(string(f))
-
-		err = os.Remove(fileStatePath)
-		assert.NoError(t, err)
+		err := os.RemoveAll(fileStatePath)
+		assert.NoError(t, err)	
 	}()
 
 	loggerEntry := logger.WithFields(logrus.Fields{
 		"name": "FileStateLogger",
 	})
 
-	fileStateLogger := NewFileStateLogger(loggerEntry, fileStatePath)
+	fileStateLogger := NewLevelDBStateLogger(loggerEntry, fileStatePath)
 
 	state := fileStateLogger.GetState()
 	assert.Nil(t, state)
@@ -49,7 +45,7 @@ func TestFileStateLogger(t *testing.T) {
 
 	fileStateLogger.Close()
 
-	fileStateLogger = NewFileStateLogger(loggerEntry, fileStatePath)
+	fileStateLogger = NewLevelDBStateLogger(loggerEntry, fileStatePath)
 	state = fileStateLogger.GetState()
 	assert.Equal(t, *state.VotedFor, "2")
 	assert.Equal(t, state.CurrentTerm, int64(2))

@@ -1,13 +1,12 @@
 package node
 
 import (
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"io/ioutil"
-	"fmt"
-	"os"
 
 	"github.com/Shopify/toxiproxy/client"
 	logrus "github.com/sirupsen/logrus"
@@ -15,20 +14,16 @@ import (
 	"raft/internal/core/persister"
 )
 
-func initializeFileStatePersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (*persister.FileStateLogger, func()) {
-	fileStateLogger := persister.NewFileStateLogger(logger.WithFields(logrus.Fields{
+func initializeStatePersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (persister.StateLogger, func()) {
+	fileStateLogger := persister.NewLevelDBStateLogger(logger.WithFields(logrus.Fields{
 		"name": "FileStateLogger",
 	}), fileStatePath)
 
+	os.RemoveAll(fileStatePath)
+
 	return fileStateLogger, func() {
 		fileStateLogger.Close()
-
-		f, err := ioutil.ReadFile(fileStatePath)
-		assert.NoError(t, err)
-
-		logger.Printf("Filename: %s. Content: %s", fileStatePath, string(f))
-
-		err = os.Remove(fileStatePath)
+		err := os.RemoveAll(fileStatePath)
 		assert.NoError(t, err)
 	}
 }
@@ -60,7 +55,9 @@ func TestLeaderElected(t *testing.T) {
 			"node": name,
 		})
 
-		fileStateLogger, fileStateLoggerClean := initializeFileStatePersister(t, logger, fmt.Sprintf("state-%s.txt", name))
+		fileStatePath := fmt.Sprintf("db_node_test_TestLeaderElected_%s.txt", name)
+		fileStateLogger, fileStateLoggerClean :=
+			initializeStatePersister(t, logger, fileStatePath)
 		defer fileStateLoggerClean()
 
 		servers = append(servers, NewServer(clusters[name], nodeLogger, fileStateLogger,
@@ -180,7 +177,9 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 			"node": name,
 		})
 
-		fileStateLogger, fileStateLoggerClean := initializeFileStatePersister(t, logger, fmt.Sprintf("state-%s.txt", name))
+		fileStatePath := fmt.Sprintf("db_node_test_TestLeaderElectedAfterPartition_%s.txt", name)
+		fileStateLogger, fileStateLoggerClean :=
+			initializeStatePersister(t, logger, fileStatePath)
 		defer fileStateLoggerClean()
 
 		servers[name] = NewServer(clusters[name], nodeLogger, fileStateLogger,
