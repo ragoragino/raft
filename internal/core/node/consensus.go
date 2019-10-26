@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	pb "raft/internal/core/node/gen"
-	"raft/internal/core/persister"
 	"sync"
 	"time"
 
@@ -109,7 +108,7 @@ type requestVoteEvent struct {
 type Server struct {
 	settings     *serverOptions
 	cluster      ICluster
-	state        *State
+	state        IState
 	stateMutex   sync.RWMutex
 	logger       *logrus.Entry
 	closeChannel chan struct{}
@@ -120,7 +119,7 @@ type Server struct {
 	requestVotesChannel  chan requestVoteEvent
 }
 
-func NewServer(cluster ICluster, logger *logrus.Entry, statePersister persister.IStateLogger,
+func NewServer(cluster ICluster, logger *logrus.Entry, state IState,
 	opts ...ServerCallOption) *Server {
 	server := &Server{
 		settings:             applyServerOptions(opts),
@@ -145,13 +144,7 @@ func NewServer(cluster ICluster, logger *logrus.Entry, statePersister persister.
 	}()
 
 	server.grpcServer = grpcServer
-
-	server.state = NewState(StateInfo{
-		CurrentTerm: 0,
-		VotedFor:    nil,
-		Role:        FOLLOWER,
-	}, statePersister)
-
+	server.state = state
 	return server
 }
 
@@ -211,7 +204,9 @@ func (s *Server) AppendEntries(ctx context.Context, request *pb.AppendEntriesReq
 }
 
 func (s *Server) RequestVote(ctx context.Context, request *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	logger := s.logger.WithFields(logrus.Fields{"RPC": "RequestVote", "Sender": request.GetCandidateId()})
+	candidateID := request.GetCandidateId()
+
+	logger := s.logger.WithFields(logrus.Fields{"RPC": "RequestVote", "Sender": candidateID})
 
 	logger.Debugf("received RPC: %+v", request)
 
@@ -231,7 +226,7 @@ func (s *Server) RequestVote(ctx context.Context, request *pb.RequestVoteRequest
 	if senderTerm > receiverTerm {
 		// The node has higher term than the node, so we switch to FOLLOWER
 		logger.Debugf("switching state to follower. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
-		s.state.SwitchState(request.GetTerm(), nil, FOLLOWER)
+		s.state.SwitchState(senderTerm, nil, FOLLOWER)
 	} else if senderTerm < receiverTerm {
 		// The candidate has lower term than the node, so deny the request
 		logger.Debugf("sending reject response. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
@@ -254,6 +249,8 @@ func (s *Server) RequestVote(ctx context.Context, request *pb.RequestVoteRequest
 	// TODO: Handle case: "and candidate's log is at least as up to date as receivers log"
 
 	logger.Debugf("voting for sender")
+
+	s.state.SwitchState(senderTerm, &candidateID, FOLLOWER)
 
 	voteGranted = true
 

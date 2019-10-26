@@ -14,6 +14,14 @@ import (
 	"raft/internal/core/persister"
 )
 
+var (
+	startingStateInfo = StateInfo{
+		CurrentTerm: 0,
+		VotedFor:    nil,
+		Role:        FOLLOWER,
+	}
+)
+
 func initializeStatePersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (persister.IStateLogger, func()) {
 	fileStateLogger := persister.NewLevelDBStateLogger(logger.WithFields(logrus.Fields{
 		"name": "FileStateLogger",
@@ -60,7 +68,9 @@ func TestLeaderElected(t *testing.T) {
 			initializeStatePersister(t, logger, fileStatePath)
 		defer fileStateLoggerClean()
 
-		servers = append(servers, NewServer(clusters[name], nodeLogger, fileStateLogger,
+		stateHandler := NewState(startingStateInfo, fileStateLogger)
+
+		servers = append(servers, NewServer(clusters[name], nodeLogger, stateHandler,
 			WithServerID(name), WithEndpoint(endpoint)))
 	}
 
@@ -182,7 +192,9 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 			initializeStatePersister(t, logger, fileStatePath)
 		defer fileStateLoggerClean()
 
-		servers[name] = NewServer(clusters[name], nodeLogger, fileStateLogger,
+		stateHandler := NewState(startingStateInfo, fileStateLogger)
+
+		servers[name] = NewServer(clusters[name], nodeLogger, stateHandler,
 			WithServerID(name), WithEndpoint(endpoint))
 	}
 

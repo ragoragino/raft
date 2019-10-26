@@ -1,25 +1,25 @@
 package persister
 
 import (
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	logrus "github.com/sirupsen/logrus"
 	"github.com/syndtr/goleveldb/leveldb"
 	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"sync"
-	"encoding/binary"
-	"encoding/json"
 )
 
 const (
-	lastLogDbKey = "last_log"
-	firstLevelDBLogIndex = 1
+	lastLogDbKey         = "last_log"
+	firstLevelDBLogIndex = 0
 )
 
 var (
 	ErrIndexedLogDoesNotExit = errors.New("Log with given index does not exist.")
 )
 
-type commandLog struct {
+type CommandLog struct {
 	Entry
 	Index uint64 `json:"Index"`
 }
@@ -31,8 +31,8 @@ type Entry struct {
 
 type EntryLogger interface {
 	AddLogs(logs []*Entry) error
-	GetLastLog() *Entry
-	FindLogByIndex(index uint64) (*Entry, error)
+	GetLastLog() (*CommandLog)
+	FindLogByIndex(index uint64) (*CommandLog, error)
 	DeleteLogsAferIndex(index uint64)
 	Close()
 }
@@ -42,7 +42,7 @@ type LevelDBEntryLogger struct {
 	db                 *leveldb.DB
 	logger             *logrus.Entry
 	lastCommandLogLock sync.RWMutex
-	lastCommandLog     *commandLog
+	lastCommandLog     *CommandLog
 }
 
 func NewLevelDBEntryLogger(logger *logrus.Entry, filePath string) *LevelDBEntryLogger {
@@ -89,7 +89,7 @@ func NewLevelDBEntryLogger(logger *logrus.Entry, filePath string) *LevelDBEntryL
 		logger.Panicf("LevelDB getting index %+v failed: %+v", value, err)
 	}
 
-	lastCommandLog := commandLog{}
+	lastCommandLog := CommandLog{}
 	err = json.Unmarshal(lastCommandLogMarshalled, &lastCommandLog)
 	if err != nil {
 		logger.Panicf("unmarshalling of log %+v failed: %+v", lastCommandLogMarshalled, err)
@@ -106,21 +106,21 @@ func (l *LevelDBEntryLogger) Close() {
 	l.db.Close()
 }
 
-func (l *LevelDBEntryLogger) GetLastLog() *Entry {
+func (l *LevelDBEntryLogger) GetLastLog() (*CommandLog) {
 	l.lastCommandLogLock.RLock()
 	if l.lastCommandLog == nil {
 		l.lastCommandLogLock.RUnlock()
 		return nil
 	}
 
-	// Make a copy, so that client cannot lastCommandLog member
-	entry := l.lastCommandLog.Entry
+	// Make a copy, so that client cannot change lastCommandLog member
+	log := *l.lastCommandLog
 	l.lastCommandLogLock.RUnlock()
-	
-	return &entry
+
+	return &log
 }
 
-func (l *LevelDBEntryLogger) FindLogByIndex(index uint64) (*Entry, error) {
+func (l *LevelDBEntryLogger) FindLogByIndex(index uint64) (*CommandLog, error) {
 	buffer := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buffer, index)
 	commandLogMarshalled, err := l.db.Get([]byte(buffer), nil)
@@ -128,13 +128,13 @@ func (l *LevelDBEntryLogger) FindLogByIndex(index uint64) (*Entry, error) {
 		return nil, err
 	}
 
-	commandLogUnmarshalled := commandLog{}
+	commandLogUnmarshalled := CommandLog{}
 	err = json.Unmarshal(commandLogMarshalled, &commandLogUnmarshalled)
 	if err != nil {
 		return nil, err
 	}
 
-	return &commandLogUnmarshalled.Entry, nil
+	return &commandLogUnmarshalled, nil
 }
 
 func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
@@ -145,16 +145,16 @@ func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
 	// TODO: Maybe change to optimistic concurrency ???
 	l.lastCommandLogLock.Lock()
 	if l.lastCommandLog != nil {
-		lastIndex = l.lastCommandLog.Index 
+		lastIndex = l.lastCommandLog.Index
 	}
 
 	batch := &leveldb.Batch{}
 
 	indexBuffer := make([]byte, 8)
-	for _, log := range logs {
+	for i, log := range logs {
 		lastIndex++
 
-		commandLog := commandLog{
+		commandLog := CommandLog{
 			Index: lastIndex,
 			Entry: *log,
 		}
@@ -167,8 +167,12 @@ func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
 
 		binary.LittleEndian.PutUint64(indexBuffer, lastIndex)
 		batch.Put(indexBuffer, commandLogMarshalled)
+
+		if i == (len(logs) - 1) {
+			batch.Put([]byte(lastLogDbKey), indexBuffer)
+		}
 	}
-	
+
 	err := l.db.Write(batch, nil)
 	if err != nil {
 		l.lastCommandLogLock.Unlock()
@@ -176,7 +180,7 @@ func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
 	}
 
 	lastLog := logs[len(logs)-1]
-	l.lastCommandLog = &commandLog{
+	l.lastCommandLog = &CommandLog{
 		Index: lastIndex,
 		Entry: *lastLog,
 	}
@@ -192,24 +196,26 @@ func (l *LevelDBEntryLogger) DeleteLogsAferIndex(index uint64) error {
 		return ErrIndexedLogDoesNotExit
 	}
 
-	lastIndex := l.lastCommandLog.Index 
+	lastIndex := l.lastCommandLog.Index
 
-	if index > lastIndex || index < firstLevelDBLogIndex {	
+	if index > lastIndex || index <= firstLevelDBLogIndex {
+		l.lastCommandLogLock.Unlock()
 		return ErrIndexedLogDoesNotExit
-	} 
+	}
 
-	var lastCommandLog *commandLog
-	if index == firstLevelDBLogIndex {
+	var lastCommandLog *CommandLog
+	if index == firstLevelDBLogIndex+1 {
 		lastCommandLog = nil
 	} else {
 		lastCommandEntry, err := l.FindLogByIndex(index - 1)
 		if err != nil {
+			l.lastCommandLogLock.Unlock()
 			return ErrIndexedLogDoesNotExit
 		}
 
-		lastCommandLog = &commandLog{
-			Index: index - 1,
-			Entry: *lastCommandEntry,
+		lastCommandLog = &CommandLog{
+			Index: lastCommandEntry.Index,
+			Entry: lastCommandEntry.Entry,
 		}
 	}
 
@@ -220,6 +226,9 @@ func (l *LevelDBEntryLogger) DeleteLogsAferIndex(index uint64) error {
 		binary.LittleEndian.PutUint64(indexBuffer, i)
 		batch.Delete(indexBuffer)
 	}
+
+	binary.LittleEndian.PutUint64(indexBuffer, lastCommandLog.Index)
+	batch.Put([]byte(lastLogDbKey), indexBuffer)
 
 	err := l.db.Write(batch, nil)
 	if err != nil {

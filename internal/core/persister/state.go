@@ -24,6 +24,7 @@ type IStateLogger interface {
 }
 
 type LevelDBStateLogger struct {
+	// leveldb.DB is safe for concurrent usage
 	db         *leveldb.DB
 	state      *State
 	logger     *logrus.Entry

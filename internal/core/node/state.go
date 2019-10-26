@@ -22,6 +22,18 @@ type StateSwitched struct {
 	newState StateInfo
 }
 
+type IState interface {
+	AddStateHandler(handler chan StateSwitched) string
+	RemoveStateHandler(id string)
+
+	GetCurrentTerm() int64
+	GetVotedFor() *string
+	GetRole() ServerRole
+	GetLastLogIndex() int64
+	GetLastLogTerm() int64
+	SwitchState(term int64, votedFor *string, role ServerRole)
+}
+
 type State struct {
 	info StateInfo
 	Log  []LogEntry
