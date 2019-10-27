@@ -11,7 +11,12 @@ import (
 )
 
 const (
+	// We will use lastLogDbKey to track which log entry is currently at the end.
+	// In case our node crashes, we just have to get the index inserted in
+	// lastLogDbKey and find the highest index present in the DB higher or equal to that.
 	lastLogDbKey         = "last_log"
+
+	// First DB Index - will be always empty
 	firstLevelDBLogIndex = 0
 )
 
@@ -31,12 +36,15 @@ type Entry struct {
 
 type EntryLogger interface {
 	AddLogs(logs []*Entry) error
-	GetLastLog() (*CommandLog)
+	GetLastLog() *CommandLog
 	FindLogByIndex(index uint64) (*CommandLog, error)
 	DeleteLogsAferIndex(index uint64)
 	Close()
 }
 
+// LevelDBEntryLogger is safe for concurrent usage,
+// although we currently don't use it from multiple goroutines
+// because AppendEntries RPC are handled sequentially
 type LevelDBEntryLogger struct {
 	// leveldb.DB is safe for concurrent usage
 	db                 *leveldb.DB
@@ -106,16 +114,16 @@ func (l *LevelDBEntryLogger) Close() {
 	l.db.Close()
 }
 
-func (l *LevelDBEntryLogger) GetLastLog() (*CommandLog) {
+func (l *LevelDBEntryLogger) GetLastLog() *CommandLog {
 	l.lastCommandLogLock.RLock()
+	defer l.lastCommandLogLock.RUnlock()
+
 	if l.lastCommandLog == nil {
-		l.lastCommandLogLock.RUnlock()
 		return nil
 	}
 
 	// Make a copy, so that client cannot change lastCommandLog member
 	log := *l.lastCommandLog
-	l.lastCommandLogLock.RUnlock()
 
 	return &log
 }
@@ -140,10 +148,9 @@ func (l *LevelDBEntryLogger) FindLogByIndex(index uint64) (*CommandLog, error) {
 func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
 	var lastIndex uint64 = firstLevelDBLogIndex
 
-	// Currently, adding of logs is under mutex,
-	// as we don't want any other function messing with the last index
-	// TODO: Maybe change to optimistic concurrency ???
 	l.lastCommandLogLock.Lock()
+	defer l.lastCommandLogLock.Unlock()
+
 	if l.lastCommandLog != nil {
 		lastIndex = l.lastCommandLog.Index
 	}
@@ -161,7 +168,6 @@ func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
 
 		commandLogMarshalled, err := json.Marshal(&commandLog)
 		if err != nil {
-			l.lastCommandLogLock.Unlock()
 			return err
 		}
 
@@ -175,7 +181,6 @@ func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
 
 	err := l.db.Write(batch, nil)
 	if err != nil {
-		l.lastCommandLogLock.Unlock()
 		return err
 	}
 
@@ -184,22 +189,21 @@ func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
 		Index: lastIndex,
 		Entry: *lastLog,
 	}
-	l.lastCommandLogLock.Unlock()
 
 	return nil
 }
 
 func (l *LevelDBEntryLogger) DeleteLogsAferIndex(index uint64) error {
 	l.lastCommandLogLock.Lock()
+ 	defer l.lastCommandLogLock.Unlock()
+
 	if l.lastCommandLog == nil {
-		l.lastCommandLogLock.Unlock()
 		return ErrIndexedLogDoesNotExit
 	}
 
 	lastIndex := l.lastCommandLog.Index
 
 	if index > lastIndex || index <= firstLevelDBLogIndex {
-		l.lastCommandLogLock.Unlock()
 		return ErrIndexedLogDoesNotExit
 	}
 
@@ -209,7 +213,6 @@ func (l *LevelDBEntryLogger) DeleteLogsAferIndex(index uint64) error {
 	} else {
 		lastCommandEntry, err := l.FindLogByIndex(index - 1)
 		if err != nil {
-			l.lastCommandLogLock.Unlock()
 			return ErrIndexedLogDoesNotExit
 		}
 
@@ -232,12 +235,10 @@ func (l *LevelDBEntryLogger) DeleteLogsAferIndex(index uint64) error {
 
 	err := l.db.Write(batch, nil)
 	if err != nil {
-		l.lastCommandLogLock.Unlock()
 		return err
 	}
 
 	l.lastCommandLog = lastCommandLog
-	l.lastCommandLogLock.Unlock()
 
 	return nil
 }

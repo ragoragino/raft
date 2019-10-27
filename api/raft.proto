@@ -5,15 +5,9 @@ package raft;
 option go_package = "raft";
 
 service Node {
-  // cluster methods
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse) {}
 
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse) {}
-
-  // client methods
-  rpc Insert(InsertRequest) returns (InsertResponse) {}
-
-  rpc Find(FindRequest) returns (FindResponse) {}
 }
 
 message AppendEntriesRequest {

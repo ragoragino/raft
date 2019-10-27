@@ -112,12 +112,12 @@ func TestLeaderElected(t *testing.T) {
 	assert.True(t, leaderExists)
 
 	// Close clusters and servers down
-	for _, cluster := range clusters {
-		cluster.Close()
-	}
-
 	for _, server := range servers {
 		server.Close()
+	}
+
+	for _, cluster := range clusters {
+		cluster.Close()
 	}
 
 	wg.Wait()
@@ -276,12 +276,12 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 	assert.Equal(t, clusters[oldLeaderID].GetClusterState().leaderName, newLeaderID)
 
 	// Close clusters and servers down
-	for _, cluster := range clusters {
-		cluster.Close()
-	}
-
 	for _, server := range servers {
 		server.Close()
+	}
+
+	for _, cluster := range clusters {
+		cluster.Close()
 	}
 
 	wg.Wait()

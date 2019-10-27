@@ -44,10 +44,10 @@ func TestFileEntryLoggerWithoutRestarts(t *testing.T) {
 		assert.Equal(t, lastReceivedLog.Index, uint64(len(entries)))
 	})
 
-	t.Run("Find", func(t *testing.T){
+	t.Run("Find", func(t *testing.T) {
 		indexOfLogToFind := 2
 		actualEntry := entries[indexOfLogToFind]
-		foundLog, err := fileEntryLogger.FindLogByIndex(uint64(indexOfLogToFind+1))
+		foundLog, err := fileEntryLogger.FindLogByIndex(uint64(indexOfLogToFind + 1))
 		assert.NoError(t, err)
 		assert.NotNil(t, foundLog)
 		assert.Equal(t, &foundLog.Entry, actualEntry)
@@ -59,7 +59,7 @@ func TestFileEntryLoggerWithoutRestarts(t *testing.T) {
 		err := fileEntryLogger.DeleteLogsAferIndex(indexToDeleteLogsAfter)
 		assert.NoError(t, err)
 
-		lastEntryIndex := indexToDeleteLogsAfter-2
+		lastEntryIndex := indexToDeleteLogsAfter - 2
 		lastActualEntry := entries[lastEntryIndex]
 		lastReceivedLog := fileEntryLogger.GetLastLog()
 		assert.NotNil(t, lastReceivedLog)
@@ -109,10 +109,10 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 		assert.Equal(t, lastReceivedLog.Index, uint64(len(entries)))
 	})
 
-	t.Run("Find", func(t *testing.T){
+	t.Run("Find", func(t *testing.T) {
 		indexOfLogToFind := 2
 		actualEntry := entries[indexOfLogToFind]
-		foundLog, err := fileEntryLogger.FindLogByIndex(uint64(indexOfLogToFind+1))
+		foundLog, err := fileEntryLogger.FindLogByIndex(uint64(indexOfLogToFind + 1))
 		assert.NoError(t, err)
 		assert.NotNil(t, foundLog)
 		assert.Equal(t, &foundLog.Entry, actualEntry)
@@ -129,7 +129,7 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 	fileEntryLogger = NewLevelDBEntryLogger(loggerEntry, fileEntryPath)
 
 	t.Run("GetAfterDelete", func(t *testing.T) {
-		lastEntryIndex := indexToDeleteLogsAfter-2
+		lastEntryIndex := indexToDeleteLogsAfter - 2
 		lastActualEntry := entries[lastEntryIndex]
 		lastReceivedLog := fileEntryLogger.GetLastLog()
 		assert.NotNil(t, lastReceivedLog)
