@@ -23,14 +23,28 @@ var (
 )
 
 func initializeStatePersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (persister.IStateLogger, func()) {
-	fileStateLogger := persister.NewLevelDBStateLogger(logger.WithFields(logrus.Fields{
-		"name": "FileStateLogger",
+	fileStatePersister := persister.NewLevelDBStateLogger(logger.WithFields(logrus.Fields{
+		"name": "LevelDBStatePersister",
 	}), fileStatePath)
 
 	os.RemoveAll(fileStatePath)
 
-	return fileStateLogger, func() {
-		fileStateLogger.Close()
+	return fileStatePersister, func() {
+		fileStatePersister.Close()
+		err := os.RemoveAll(fileStatePath)
+		assert.NoError(t, err)
+	}
+}
+
+func initializeLogEntryPersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (persister.ILogEntryPersister, func()) {
+	fileLogEntryPersister := persister.NewLevelDBLogEntryPersister(logger.WithFields(logrus.Fields{
+		"name": "LevelDBLogPersister",
+	}), fileStatePath)
+
+	os.RemoveAll(fileStatePath)
+
+	return fileLogEntryPersister, func() {
+		fileLogEntryPersister.Close()
 		err := os.RemoveAll(fileStatePath)
 		assert.NoError(t, err)
 	}
@@ -63,14 +77,20 @@ func TestLeaderElected(t *testing.T) {
 			"node": name,
 		})
 
-		fileStatePath := fmt.Sprintf("db_node_test_TestLeaderElected_%s.txt", name)
+		fileStatePath := fmt.Sprintf("db_node_test_TestLeaderElected_State_%s.txt", name)
 		fileStateLogger, fileStateLoggerClean :=
 			initializeStatePersister(t, logger, fileStatePath)
 		defer fileStateLoggerClean()
 
-		stateHandler := NewState(startingStateInfo, fileStateLogger)
+		fileLogPath := fmt.Sprintf("db_node_test_TestLeaderElected_Log_%s.txt", name)
+		fileLogLogger, fileLogLoggerClean :=
+			initializeLogEntryPersister(t, logger, fileLogPath)
+		defer fileLogLoggerClean()
 
-		servers = append(servers, NewServer(clusters[name], nodeLogger, stateHandler,
+		stateHandler := NewStateManager(startingStateInfo, fileStateLogger)
+		logHandler := NewLogEntryManager(fileLogLogger)
+
+		servers = append(servers, NewServer(clusters[name], nodeLogger, stateHandler, logHandler,
 			WithServerID(name), WithEndpoint(endpoint)))
 	}
 
@@ -104,7 +124,7 @@ func TestLeaderElected(t *testing.T) {
 	leaderExists := false
 	for _, server := range servers {
 		server.stateMutex.RLock()
-		if server.state.GetRole() == LEADER {
+		if server.stateManager.GetRole() == LEADER {
 			leaderExists = true
 		}
 		server.stateMutex.RUnlock()
@@ -187,14 +207,20 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 			"node": name,
 		})
 
-		fileStatePath := fmt.Sprintf("db_node_test_TestLeaderElectedAfterPartition_%s.txt", name)
+		fileStatePath := fmt.Sprintf("db_node_test_TestLeaderElectedAfterPartition_State_%s.txt", name)
 		fileStateLogger, fileStateLoggerClean :=
 			initializeStatePersister(t, logger, fileStatePath)
 		defer fileStateLoggerClean()
 
-		stateHandler := NewState(startingStateInfo, fileStateLogger)
+		fileLogPath := fmt.Sprintf("db_node_test_TestLeaderElectedAfterPartition_Log_%s.txt", name)
+		fileLogLogger, fileLogLoggerClean :=
+			initializeLogEntryPersister(t, logger, fileLogPath)
+		defer fileLogLoggerClean()
 
-		servers[name] = NewServer(clusters[name], nodeLogger, stateHandler,
+		stateHandler := NewStateManager(startingStateInfo, fileStateLogger)
+		logHandler := NewLogEntryManager(fileLogLogger)
+
+		servers[name] = NewServer(clusters[name], nodeLogger, stateHandler, logHandler,
 			WithServerID(name), WithEndpoint(endpoint))
 	}
 
@@ -221,7 +247,7 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 	oldLeaderID := ""
 	for _, server := range servers {
 		server.stateMutex.RLock()
-		if server.state.GetRole() == LEADER {
+		if server.stateManager.GetRole() == LEADER {
 			oldLeaderExists = true
 			oldLeaderID = server.settings.ID
 		}
@@ -249,7 +275,7 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 	newLeaderID := ""
 	for _, server := range servers {
 		server.stateMutex.RLock()
-		if server.state.GetRole() == LEADER && server.settings.ID != oldLeaderID {
+		if server.stateManager.GetRole() == LEADER && server.settings.ID != oldLeaderID {
 			newLeaderExists = true
 			newLeaderID = server.settings.ID
 		}

@@ -6,13 +6,8 @@ import (
 	"raft/internal/core/persister"
 )
 
-type LogEntry struct {
-	Command string
-	Term    int64
-}
-
 type StateInfo struct {
-	CurrentTerm int64
+	CurrentTerm uint64
 	VotedFor    *string
 	Role        ServerRole
 }
@@ -22,41 +17,41 @@ type StateSwitched struct {
 	newState StateInfo
 }
 
-type IState interface {
-	AddStateHandler(handler chan StateSwitched) string
-	RemoveStateHandler(id string)
+type IStateManager interface {
+	AddStateObserver(handler chan StateSwitched) string
+	RemoveStateObserver(id string)
 
-	GetCurrentTerm() int64
+	GetCurrentTerm() uint64
 	GetVotedFor() *string
 	GetRole() ServerRole
-	GetLastLogIndex() int64
-	GetLastLogTerm() int64
-	SwitchState(term int64, votedFor *string, role ServerRole)
+	SwitchState(term uint64, votedFor *string, role ServerRole)
 }
 
-type State struct {
+type StateManager struct {
 	info StateInfo
-	Log  []LogEntry
 
 	statePersister persister.IStateLogger
 
 	handlers map[string]chan StateSwitched
 }
 
-func NewState(stateInfo StateInfo, statePersister persister.IStateLogger) *State {
+// StateManager is not safe for concurrent usage, as it is expected to be used
+// mainly with transaction operations. Therefore, clients using StateManager should
+// implement appropriate locking mechanisms
+func NewStateManager(stateInfo StateInfo, statePersister persister.IStateLogger) *StateManager {
 	statePersister.UpdateState(&persister.State{
 		VotedFor:    stateInfo.VotedFor,
 		CurrentTerm: stateInfo.CurrentTerm,
 	})
 
-	return &State{
+	return &StateManager{
 		info:           stateInfo,
 		statePersister: statePersister,
 		handlers:       make(map[string]chan StateSwitched),
 	}
 }
 
-func (s *State) AddStateHandler(handler chan StateSwitched) string {
+func (s *StateManager) AddStateObserver(handler chan StateSwitched) string {
 	id, err := uuid.NewUUID()
 	if err != nil {
 		logrus.Panicf("unable to create new uuid: %+v", err)
@@ -69,38 +64,23 @@ func (s *State) AddStateHandler(handler chan StateSwitched) string {
 	return idStr
 }
 
-func (s *State) RemoveStateHandler(id string) {
+func (s *StateManager) RemoveStateObserver(id string) {
 	delete(s.handlers, id)
 }
 
-func (s *State) GetCurrentTerm() int64 {
+func (s *StateManager) GetCurrentTerm() uint64 {
 	return s.statePersister.GetState().CurrentTerm
 }
 
-func (s *State) GetVotedFor() *string {
+func (s *StateManager) GetVotedFor() *string {
 	return s.statePersister.GetState().VotedFor
 }
 
-func (s *State) GetRole() ServerRole {
+func (s *StateManager) GetRole() ServerRole {
 	return s.info.Role
 }
 
-func (s *State) GetLastLogIndex() int64 {
-	// TODO
-	return int64(len(s.Log) + 1)
-}
-
-func (s *State) GetLastLogTerm() int64 {
-	logLength := len(s.Log)
-	if logLength == 0 {
-		// TODO
-		return 1
-	}
-
-	return s.Log[len(s.Log)-1].Term
-}
-
-func (s *State) SwitchState(term int64, votedFor *string, role ServerRole) {
+func (s *StateManager) SwitchState(term uint64, votedFor *string, role ServerRole) {
 	oldInfo := s.info
 
 	s.statePersister.UpdateState(&persister.State{

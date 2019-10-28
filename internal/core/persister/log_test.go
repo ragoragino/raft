@@ -22,7 +22,7 @@ func TestFileEntryLoggerWithoutRestarts(t *testing.T) {
 		"name": "FileEntryLogger",
 	})
 
-	fileEntryLogger := NewLevelDBEntryLogger(loggerEntry, fileEntryPath)
+	fileEntryLogger := NewLevelDBLogEntryPersister(loggerEntry, fileEntryPath)
 	defer fileEntryLogger.Close()
 
 	entries := []*Entry{
@@ -34,7 +34,7 @@ func TestFileEntryLoggerWithoutRestarts(t *testing.T) {
 	}
 
 	t.Run("Add&Get", func(t *testing.T) {
-		err := fileEntryLogger.AddLogs(entries)
+		err := fileEntryLogger.AppendLogs(entries)
 		assert.NoError(t, err)
 
 		lastActualEntry := entries[len(entries)-1]
@@ -83,7 +83,7 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 		"name": "FileEntryLogger",
 	})
 
-	fileEntryLogger := NewLevelDBEntryLogger(loggerEntry, fileEntryPath)
+	fileEntryLogger := NewLevelDBLogEntryPersister(loggerEntry, fileEntryPath)
 
 	entries := []*Entry{
 		&Entry{Term: uint64(1), Command: []byte("1")},
@@ -94,12 +94,12 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 	}
 
 	t.Run("Add", func(t *testing.T) {
-		err := fileEntryLogger.AddLogs(entries)
+		err := fileEntryLogger.AppendLogs(entries)
 		assert.NoError(t, err)
 	})
 
 	fileEntryLogger.Close()
-	fileEntryLogger = NewLevelDBEntryLogger(loggerEntry, fileEntryPath)
+	fileEntryLogger = NewLevelDBLogEntryPersister(loggerEntry, fileEntryPath)
 
 	t.Run("GetAfterAdd", func(t *testing.T) {
 		lastActualEntry := entries[len(entries)-1]
@@ -126,7 +126,7 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 	})
 
 	fileEntryLogger.Close()
-	fileEntryLogger = NewLevelDBEntryLogger(loggerEntry, fileEntryPath)
+	fileEntryLogger = NewLevelDBLogEntryPersister(loggerEntry, fileEntryPath)
 
 	t.Run("GetAfterDelete", func(t *testing.T) {
 		lastEntryIndex := indexToDeleteLogsAfter - 2

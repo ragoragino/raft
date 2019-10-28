@@ -13,7 +13,7 @@ var (
 )
 
 type State struct {
-	CurrentTerm int64   `json:"CurrentTerm"`
+	CurrentTerm uint64  `json:"CurrentTerm"`
 	VotedFor    *string `json:"VotedFor"`
 }
 

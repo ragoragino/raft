@@ -14,14 +14,14 @@ const (
 	// We will use lastLogDbKey to track which log entry is currently at the end.
 	// In case our node crashes, we just have to get the index inserted in
 	// lastLogDbKey and find the highest index present in the DB higher or equal to that.
-	lastLogDbKey         = "last_log"
+	lastLogDbKey = "last_log"
 
 	// First DB Index - will be always empty
 	firstLevelDBLogIndex = 0
 )
 
 var (
-	ErrIndexedLogDoesNotExit = errors.New("Log with given index does not exist.")
+	ErrIndexedLogDoesNotExists = errors.New("Log with given index does not exist.")
 )
 
 type CommandLog struct {
@@ -34,18 +34,18 @@ type Entry struct {
 	Command []byte `json:"Command"`
 }
 
-type EntryLogger interface {
-	AddLogs(logs []*Entry) error
+type ILogEntryPersister interface {
+	AppendLogs(logs []*Entry) error
 	GetLastLog() *CommandLog
 	FindLogByIndex(index uint64) (*CommandLog, error)
-	DeleteLogsAferIndex(index uint64)
+	DeleteLogsAferIndex(index uint64) error
 	Close()
 }
 
-// LevelDBEntryLogger is safe for concurrent usage,
+// LevelDBLogEntryPersister is safe for concurrent usage,
 // although we currently don't use it from multiple goroutines
 // because AppendEntries RPC are handled sequentially
-type LevelDBEntryLogger struct {
+type LevelDBLogEntryPersister struct {
 	// leveldb.DB is safe for concurrent usage
 	db                 *leveldb.DB
 	logger             *logrus.Entry
@@ -53,7 +53,7 @@ type LevelDBEntryLogger struct {
 	lastCommandLog     *CommandLog
 }
 
-func NewLevelDBEntryLogger(logger *logrus.Entry, filePath string) *LevelDBEntryLogger {
+func NewLevelDBLogEntryPersister(logger *logrus.Entry, filePath string) *LevelDBLogEntryPersister {
 	db, err := leveldb.OpenFile(filePath, nil)
 	if leveldb_errors.IsCorrupted(err) {
 		var err error
@@ -67,7 +67,7 @@ func NewLevelDBEntryLogger(logger *logrus.Entry, filePath string) *LevelDBEntryL
 
 	value, err := db.Get([]byte(lastLogDbKey), nil)
 	if err == leveldb_errors.ErrNotFound {
-		return &LevelDBEntryLogger{
+		return &LevelDBLogEntryPersister{
 			db:             db,
 			logger:         logger,
 			lastCommandLog: nil,
@@ -103,18 +103,18 @@ func NewLevelDBEntryLogger(logger *logrus.Entry, filePath string) *LevelDBEntryL
 		logger.Panicf("unmarshalling of log %+v failed: %+v", lastCommandLogMarshalled, err)
 	}
 
-	return &LevelDBEntryLogger{
+	return &LevelDBLogEntryPersister{
 		db:             db,
 		logger:         logger,
 		lastCommandLog: &lastCommandLog,
 	}
 }
 
-func (l *LevelDBEntryLogger) Close() {
+func (l *LevelDBLogEntryPersister) Close() {
 	l.db.Close()
 }
 
-func (l *LevelDBEntryLogger) GetLastLog() *CommandLog {
+func (l *LevelDBLogEntryPersister) GetLastLog() *CommandLog {
 	l.lastCommandLogLock.RLock()
 	defer l.lastCommandLogLock.RUnlock()
 
@@ -128,11 +128,13 @@ func (l *LevelDBEntryLogger) GetLastLog() *CommandLog {
 	return &log
 }
 
-func (l *LevelDBEntryLogger) FindLogByIndex(index uint64) (*CommandLog, error) {
+func (l *LevelDBLogEntryPersister) FindLogByIndex(index uint64) (*CommandLog, error) {
 	buffer := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buffer, index)
 	commandLogMarshalled, err := l.db.Get([]byte(buffer), nil)
-	if err != nil {
+	if err == leveldb_errors.ErrNotFound {
+		return nil, ErrIndexedLogDoesNotExists
+	} else if err != nil {
 		return nil, err
 	}
 
@@ -145,7 +147,7 @@ func (l *LevelDBEntryLogger) FindLogByIndex(index uint64) (*CommandLog, error) {
 	return &commandLogUnmarshalled, nil
 }
 
-func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
+func (l *LevelDBLogEntryPersister) AppendLogs(logs []*Entry) error {
 	var lastIndex uint64 = firstLevelDBLogIndex
 
 	l.lastCommandLogLock.Lock()
@@ -193,18 +195,18 @@ func (l *LevelDBEntryLogger) AddLogs(logs []*Entry) error {
 	return nil
 }
 
-func (l *LevelDBEntryLogger) DeleteLogsAferIndex(index uint64) error {
+func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	l.lastCommandLogLock.Lock()
- 	defer l.lastCommandLogLock.Unlock()
+	defer l.lastCommandLogLock.Unlock()
 
 	if l.lastCommandLog == nil {
-		return ErrIndexedLogDoesNotExit
+		return ErrIndexedLogDoesNotExists
 	}
 
 	lastIndex := l.lastCommandLog.Index
 
 	if index > lastIndex || index <= firstLevelDBLogIndex {
-		return ErrIndexedLogDoesNotExit
+		return ErrIndexedLogDoesNotExists
 	}
 
 	var lastCommandLog *CommandLog
@@ -213,7 +215,7 @@ func (l *LevelDBEntryLogger) DeleteLogsAferIndex(index uint64) error {
 	} else {
 		lastCommandEntry, err := l.FindLogByIndex(index - 1)
 		if err != nil {
-			return ErrIndexedLogDoesNotExit
+			return err
 		}
 
 		lastCommandLog = &CommandLog{

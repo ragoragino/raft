@@ -1,2 +1,2 @@
-26.10.2019:
-- implement AppendEntries RPC logic
+28.10.2019:
+- TODO: implement HTTP server + move gRPC server + implement HTTP server

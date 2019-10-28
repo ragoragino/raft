@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	pb "raft/internal/core/node/gen"
+	"raft/internal/core/persister"
 	"sync"
 	"time"
 
@@ -92,7 +93,7 @@ func (s ServerRole) String() string {
 	case LEADER:
 		return "LEADER"
 	default:
-		logrus.Panicf("Unrecognized ServerRole: %d", int(s))	
+		logrus.Panicf("Unrecognized ServerRole: %d", int(s))
 	}
 
 	return ""
@@ -129,7 +130,8 @@ type requestVoteProcessRequest struct {
 type Server struct {
 	settings     *serverOptions
 	cluster      ICluster
-	state        IState
+	stateManager IStateManager
+	logManager   ILogEntryManager
 	stateMutex   sync.RWMutex
 	logger       *logrus.Entry
 	closeChannel chan struct{}
@@ -143,12 +145,14 @@ type Server struct {
 	requestVoteProcessChannel   chan requestVoteProcessRequest
 }
 
-func NewServer(cluster ICluster, logger *logrus.Entry, state IState,
-	opts ...ServerCallOption) *Server {
+func NewServer(cluster ICluster, logger *logrus.Entry, stateManager IStateManager,
+	logManager ILogEntryManager, opts ...ServerCallOption) *Server {
 	server := &Server{
 		settings:                     applyServerOptions(opts),
 		cluster:                      cluster,
 		logger:                       logger,
+		stateManager:                 stateManager,
+		logManager:                   logManager,
 		closeChannel:                 make(chan struct{}),
 		appendEntriesHandlersChannel: make(chan appendEntriesEvent),
 		requestVoteHandlersChannel:   make(chan requestVoteEvent),
@@ -170,7 +174,6 @@ func NewServer(cluster ICluster, logger *logrus.Entry, state IState,
 	}()
 
 	server.grpcServer = grpcServer
-	server.state = state
 	return server
 }
 
@@ -206,9 +209,9 @@ func (s *Server) RequestVote(ctx context.Context, request *pb.RequestVoteRequest
 
 func (s *Server) Run() {
 	stateChangedChannel := make(chan StateSwitched)
-	id := s.state.AddStateHandler(stateChangedChannel)
+	id := s.stateManager.AddStateObserver(stateChangedChannel)
 	defer func() {
-		s.state.RemoveStateHandler(id)
+		s.stateManager.RemoveStateObserver(id)
 		close(stateChangedChannel)
 	}()
 
@@ -280,9 +283,9 @@ func (s *Server) HandleRoleFollower(ctx context.Context, stateChangedChannel <-c
 
 				s.logger.Debugf("election timed out, therefore switching to CANDIDATE role")
 
-				newTerm := s.state.GetCurrentTerm() + 1
+				newTerm := s.stateManager.GetCurrentTerm() + 1
 				votedFor := s.settings.ID
-				s.state.SwitchState(newTerm, &votedFor, CANDIDATE)
+				s.stateManager.SwitchState(newTerm, &votedFor, CANDIDATE)
 
 				s.stateMutex.Unlock()
 			case <-ctx.Done():
@@ -381,10 +384,10 @@ func (s *Server) HandleRoleCandidate(ctx context.Context, stateChangedChannel <-
 func (s *Server) broadcastRequestVote(ctx context.Context) {
 	s.stateMutex.RLock()
 	request := &pb.RequestVoteRequest{
-		Term:         s.state.GetCurrentTerm(),
+		Term:         s.stateManager.GetCurrentTerm(),
 		CandidateId:  s.settings.ID,
-		LastLogIndex: s.state.GetLastLogIndex(),
-		LastLogTerm:  s.state.GetLastLogTerm(),
+		LastLogIndex: s.logManager.GetLastLogIndex(),
+		LastLogTerm:  s.logManager.GetLastLogTerm(),
 	}
 	s.stateMutex.RUnlock()
 
@@ -397,15 +400,15 @@ func (s *Server) broadcastRequestVote(ctx context.Context) {
 	defer s.stateMutex.Unlock()
 
 	// Check if the state hasn't been changed in the meantime
-	if s.state.GetRole() != CANDIDATE {
+	if s.stateManager.GetRole() != CANDIDATE {
 		return
 	}
 
 	// Count the number of votes
 	for _, response := range responses {
 		// If the response contains higher term, we convert to follower
-		if response.GetTerm() > s.state.GetCurrentTerm() {
-			s.state.SwitchState(response.GetTerm(), nil, FOLLOWER)
+		if response.GetTerm() > s.stateManager.GetCurrentTerm() {
+			s.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
 			return
 		}
 
@@ -418,7 +421,7 @@ func (s *Server) broadcastRequestVote(ctx context.Context) {
 	clusterState := s.cluster.GetClusterState()
 	clusterMajority := int(math.Round(float64(clusterState.numberOfNodes) * 0.5))
 	if countOfVotes > clusterMajority {
-		s.state.SwitchState(s.state.GetCurrentTerm(), nil, LEADER)
+		s.stateManager.SwitchState(s.stateManager.GetCurrentTerm(), nil, LEADER)
 	}
 }
 
@@ -479,7 +482,7 @@ func (s *Server) HandleRoleLeader(ctx context.Context, stateChangedChannel <-cha
 func (s *Server) broadcastHeartbeat(ctx context.Context) {
 	s.stateMutex.RLock()
 	request := &pb.AppendEntriesRequest{
-		Term:     s.state.GetCurrentTerm(),
+		Term:     s.stateManager.GetCurrentTerm(),
 		LeaderId: s.settings.ID,
 		Entries:  make([]*pb.AppendEntriesRequest_Entry, 0),
 	}
@@ -491,28 +494,25 @@ func (s *Server) broadcastHeartbeat(ctx context.Context) {
 	defer s.stateMutex.Unlock()
 
 	// Check if we are still the leader
-	if s.state.GetRole() != LEADER {
+	if s.stateManager.GetRole() != LEADER {
 		return
 	}
 
-	// Check if any of the responses contains higher term, 
+	// Check if any of the responses contains higher term,
 	// in which case we have to convert to FOLLOWER state
 	for _, response := range responses {
-		if response.GetTerm() > s.state.GetCurrentTerm() {
-			s.state.SwitchState(response.GetTerm(), nil, FOLLOWER)
+		if response.GetTerm() > s.stateManager.GetCurrentTerm() {
+			s.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
 			return
 		}
 	}
 }
 
-// TODO: Does it make sense to have these functions run in goroutine mode?
+// TODO: processAppendEntries and processRequestVote should be optimized (if possible)
+// because currently they take lock for almost all operations
+// if not possible, move their calls from Run method to state handlers
 func (s *Server) processAppendEntries() {
-	for {
-		appendEntryToProcess, ok := <-s.appendEntriesProcessChannel
-		if !ok {
-			return
-		}
-
+	for appendEntryToProcess := range s.appendEntriesProcessChannel {
 		request := appendEntryToProcess.Request
 		responseChannel := appendEntryToProcess.ResponseChannel
 
@@ -523,7 +523,7 @@ func (s *Server) processAppendEntries() {
 		s.stateMutex.Lock()
 
 		senderTerm := request.GetTerm()
-		receiverTerm := s.state.GetCurrentTerm()
+		receiverTerm := s.stateManager.GetCurrentTerm()
 
 		responseFunc := func(sentByLeader bool, entriesAppended bool) {
 			s.appendEntriesHandlersChannel <- appendEntriesEvent{
@@ -542,30 +542,53 @@ func (s *Server) processAppendEntries() {
 		if senderTerm > receiverTerm {
 			// The node has higher term than the node, so we switch to FOLLOWER
 			logger.Debugf("switching state to follower. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
-			s.state.SwitchState(request.GetTerm(), nil, FOLLOWER)
+			s.stateManager.SwitchState(request.GetTerm(), nil, FOLLOWER)
 		} else if senderTerm < receiverTerm {
 			// The candidate has lower term than the node, so deny the request
 			logger.Debugf("sending reject response. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
-
 			s.stateMutex.Unlock()
-
 			responseFunc(false, false)
-			break
-		} else if s.state.GetRole() == CANDIDATE {
+			continue
+		} else if s.stateManager.GetRole() == CANDIDATE {
 			logger.Debugf("switching state to follower because received request with an equal term from a leader")
-			s.state.SwitchState(request.GetTerm(), nil, FOLLOWER)
+			s.stateManager.SwitchState(request.GetTerm(), nil, FOLLOWER)
 		}
 
 		// Set the leader
 		err := s.cluster.SetLeader(request.GetLeaderId())
 		if err != nil {
-			s.logger.Errorf("unable to set leader: %+v", err)
+			logger.Errorf("unable to set leader: %+v", err)
+		}
+
+		index := request.GetPrevLogIndex()
+		log, err := s.logManager.FindLogByIndex(index)
+		if err == persister.ErrIndexedLogDoesNotExists {
+			s.stateMutex.Unlock()
+			responseFunc(true, false)
+			continue
+		} else if err != nil {
+			s.stateMutex.Unlock()
+			logger.Panicf("unable to find log by index %d: %+v", index, err)
+		}
+
+		if log.Term != request.GetPrevLogTerm() {
+			err := s.logManager.DeleteLogsAferIndex(index)
+			if err != nil {
+				s.stateMutex.Unlock()
+				logger.Panicf("unable to delete log after index %d: %+v", index, err)
+			}
+		}
+
+		entries := request.GetEntries()
+		if len(entries) != 0 {
+			err := s.logManager.AppendLogs(s.stateManager.GetCurrentTerm(), entries)
+			if err != nil {
+				s.stateMutex.Unlock()
+				logger.Panicf("unable to append logs: %+v", err)
+			}
 		}
 
 		s.stateMutex.Unlock()
-
-		// TODO: Handle all other cases
-		// TODO: Check if it is a heartbeat from the leader
 
 		logger.Debugf("sending accept response")
 
@@ -574,12 +597,7 @@ func (s *Server) processAppendEntries() {
 }
 
 func (s *Server) processRequestVote() {
-	for {
-		requestVoteToProcess, ok := <-s.requestVoteProcessChannel
-		if !ok {
-			return
-		}
-
+	for requestVoteToProcess := range s.requestVoteProcessChannel {
 		request := requestVoteToProcess.Request
 		responseChannel := requestVoteToProcess.ResponseChannel
 
@@ -592,7 +610,7 @@ func (s *Server) processRequestVote() {
 		s.stateMutex.Lock()
 
 		senderTerm := request.GetTerm()
-		receiverTerm := s.state.GetCurrentTerm()
+		receiverTerm := s.stateManager.GetCurrentTerm()
 
 		responseFunc := func(voteGranted bool) {
 			s.requestVoteHandlersChannel <- requestVoteEvent{
@@ -611,35 +629,54 @@ func (s *Server) processRequestVote() {
 		if senderTerm > receiverTerm {
 			// Sender node has higher term than receiver node, so we switch to FOLLOWER
 			logger.Debugf("switching state to follower. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
-			s.state.SwitchState(senderTerm, nil, FOLLOWER)
+			s.stateManager.SwitchState(senderTerm, nil, FOLLOWER)
 		} else if senderTerm < receiverTerm {
 			// The candidate has lower term than the node, so deny the request
 			logger.Debugf("sending reject response. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
 
 			s.stateMutex.Unlock()
-
 			responseFunc(false)
-			break
+			continue
 		}
 
 		// The node has already voted
-		if s.state.GetVotedFor() != nil && *s.state.GetVotedFor() != request.GetCandidateId() {
-			logger.Debugf("sending reject response. Already voted for: %s", *s.state.GetVotedFor())
+		if s.stateManager.GetVotedFor() != nil && *s.stateManager.GetVotedFor() != request.GetCandidateId() {
+			logger.Debugf("sending reject response. Already voted for: %s", *s.stateManager.GetVotedFor())
 
 			s.stateMutex.Unlock()
-
 			responseFunc(false)
-			break
+			continue
 		}
 
-		// TODO: Handle case: "and candidate's log is at least as up to date as receivers log"
+		// Ensure that the candidate's log is at least as up to date as receivers log
+		lastReceiverTerm := s.logManager.GetLastLogTerm()
+		lastSenderTerm := request.GetLastLogTerm()
+		if lastReceiverTerm > lastSenderTerm {
+			logger.Debugf("sending reject response. Last log has higher term. Receiver: %d, Sender: %d",
+				lastReceiverTerm, lastSenderTerm)
+
+			s.stateMutex.Unlock()
+			responseFunc(false)
+			continue
+		} else if lastSenderTerm == lastReceiverTerm {
+			lastReceiverIndex := s.logManager.GetLastLogIndex()
+			lastSenderIndex := request.GetLastLogIndex()
+
+			if lastReceiverIndex > lastSenderIndex {
+				logger.Debugf("sending reject response. Last log has higher index. Receiver: %d, Sender: %d",
+				lastReceiverIndex, lastSenderIndex)
+
+				s.stateMutex.Unlock()
+				responseFunc(false)
+				continue
+			}
+		}
 
 		logger.Debugf("voting for sender")
 
-		s.state.SwitchState(senderTerm, &candidateID, FOLLOWER)
+		s.stateManager.SwitchState(senderTerm, &candidateID, FOLLOWER)
 
 		s.stateMutex.Unlock()
-
 		responseFunc(true)
 	}
 }

@@ -30,17 +30,17 @@ func TestFileStateLogger(t *testing.T) {
 	votedFor := "1"
 	fileStateLogger.UpdateState(&State{
 		VotedFor:    &votedFor,
-		CurrentTerm: int64(1),
+		CurrentTerm: uint64(1),
 	})
 
 	state = fileStateLogger.GetState()
 	assert.Equal(t, *state.VotedFor, "1")
-	assert.Equal(t, state.CurrentTerm, int64(1))
+	assert.Equal(t, state.CurrentTerm, uint64(1))
 
 	votedFor = "2"
 	fileStateLogger.UpdateState(&State{
 		VotedFor:    &votedFor,
-		CurrentTerm: int64(2),
+		CurrentTerm: uint64(2),
 	})
 
 	fileStateLogger.Close()
@@ -48,7 +48,7 @@ func TestFileStateLogger(t *testing.T) {
 	fileStateLogger = NewLevelDBStateLogger(loggerEntry, fileStatePath)
 	state = fileStateLogger.GetState()
 	assert.Equal(t, *state.VotedFor, "2")
-	assert.Equal(t, state.CurrentTerm, int64(2))
+	assert.Equal(t, state.CurrentTerm, uint64(2))
 
 	fileStateLogger.Close()
 }
