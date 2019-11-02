@@ -131,7 +131,6 @@ func (c *Cluster) GetClusterState() ClusterState {
 	leaderName := ""
 	leaderEndpoint := ""
 
-	// NOTE: In case there is no leader, maybe just set to some random node?
 	if c.leader != nil {
 		leaderName = c.leader.name
 		leaderEndpoint = c.leader.endpoint

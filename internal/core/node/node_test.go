@@ -7,6 +7,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"os/exec"
+	"runtime"
+	"context"
 
 	"github.com/Shopify/toxiproxy/client"
 	logrus "github.com/sirupsen/logrus"
@@ -54,6 +57,9 @@ func TestLeaderElected(t *testing.T) {
 	logrus.SetLevel(logrus.DebugLevel)
 
 	logger := logrus.StandardLogger()
+	logger.SetFormatter(&logrus.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
+	})
 
 	endpoints := map[string]string{
 		"Node0": "localhost:10000",
@@ -162,10 +168,32 @@ func createProxy(t *testing.T, endpoints map[string]string, clusterEndpoints map
 	return toxiClient
 }
 
+func startProxyServer(t *testing.T) (*exec.Cmd, func()) {
+	toxiProxyBinaryPath := "../../../toxiproxy-server-linux-amd64"
+
+	if runtime.GOOS == "windows" {
+		toxiProxyBinaryPath = "../../../toxiproxy-server-windows-amd64.exe"
+	}
+
+	if _, err := os.Stat(toxiProxyBinaryPath); os.IsNotExist(err) {
+		t.Fatalf("toxiproxy server binary is missing")	
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, toxiProxyBinaryPath)
+
+	go cmd.Run()
+
+	return cmd, cancel
+}
+
 func TestLeaderElectedAfterPartition(t *testing.T) {
 	logrus.SetLevel(logrus.DebugLevel)
 
 	logger := logrus.StandardLogger()
+	logger.SetFormatter(&logrus.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
+	})
 
 	// Initialize all endpoints and proxy endpoints
 	endpoints := map[string]string{
@@ -180,6 +208,7 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 		"Node2": {"Node0": "localhost:13001", "Node1": "localhost:13002"},
 	}
 
+	proxyCmd, killProxyServer := startProxyServer(t)
 	toxiClient := createProxy(t, endpoints, clusterProxyEndpoints)
 	defer func() {
 		proxies, err := toxiClient.Proxies()
@@ -189,6 +218,9 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 			err := proxy.Delete()
 			assert.NoError(t, err)
 		}
+
+		killProxyServer()
+		proxyCmd.Wait()
 	}()
 
 	clusters := make(map[string]*Cluster, len(endpoints))
@@ -297,7 +329,8 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 	}
 
 	// Check if the old leader respects the new one
-	time.Sleep(timeToLeader * 2)
+	// Increase the sleep a bit due to proxies restarting
+	time.Sleep(timeToLeader * 3)
 
 	assert.Equal(t, clusters[oldLeaderID].GetClusterState().leaderName, newLeaderID)
 

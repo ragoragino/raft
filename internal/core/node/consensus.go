@@ -92,10 +92,9 @@ func (s ServerRole) String() string {
 		return "CANDIDATE"
 	case LEADER:
 		return "LEADER"
-	default:
-		logrus.Panicf("Unrecognized ServerRole: %d", int(s))
 	}
 
+	logrus.Panicf("Unrecognized ServerRole: %d", int(s))
 	return ""
 }
 
@@ -274,8 +273,10 @@ func (s *Server) HandleRoleFollower(ctx context.Context, stateChangedChannel <-c
 
 	go func() {
 		electionTimeout := newElectionTimeout(s.settings.MinElectionTimeout, s.settings.MaxElectionTimeout)
-
 		electionTimedChannel := make(chan struct{})
+
+		// We will switch state in this goroutine after the follower times out
+		// and wait for the invoked event to come in order to return from the handler
 		go func() {
 			select {
 			case <-electionTimedChannel:
@@ -334,8 +335,10 @@ func (s *Server) HandleRoleCandidate(ctx context.Context, stateChangedChannel <-
 		for {
 			select {
 			case stateChangedEvent := <-stateChangedChannel:
-				// No need to check what is the new state
-				// because candidate can only result from the FOLLOWER state handler
+				if stateChangedEvent.newState.Role == CANDIDATE {
+					break
+				}
+
 				doneChannel <- stateChangedEvent.newState.Role
 				close(doneChannel)
 				return
@@ -356,8 +359,10 @@ func (s *Server) HandleRoleCandidate(ctx context.Context, stateChangedChannel <-
 			case <-s.appendEntriesHandlersChannel:
 			case <-s.requestVoteHandlersChannel:
 			case stateChangedEvent := <-stateChangedChannel:
-				// No need to check what is the new state
-				// because candidate can only result from the FOLLOWER state handler
+				if stateChangedEvent.newState.Role == CANDIDATE {
+					break
+				}
+
 				cancel()
 				serverRole = stateChangedEvent.newState.Role
 				break outerloop
@@ -434,8 +439,10 @@ func (s *Server) HandleRoleLeader(ctx context.Context, stateChangedChannel <-cha
 		for {
 			select {
 			case stateChangedEvent := <-stateChangedChannel:
-				// No need to check what is the new state
-				// because leader can only result from the CANDIDATE state handler
+				if stateChangedEvent.newState.Role == LEADER {
+					break
+				}
+
 				doneChannel <- stateChangedEvent.newState.Role
 				close(doneChannel)
 				return
@@ -454,8 +461,10 @@ func (s *Server) HandleRoleLeader(ctx context.Context, stateChangedChannel <-cha
 			case <-s.appendEntriesHandlersChannel:
 			case <-s.requestVoteHandlersChannel:
 			case stateChangedEvent := <-stateChangedChannel:
-				// No need to check what is the new state
-				// because leader can only result from the CANDIDATE state handler
+				if stateChangedEvent.newState.Role == LEADER {
+					break
+				}
+
 				cancel()
 				serverRole = stateChangedEvent.newState.Role
 				break outerloop
@@ -664,7 +673,7 @@ func (s *Server) processRequestVote() {
 
 			if lastReceiverIndex > lastSenderIndex {
 				logger.Debugf("sending reject response. Last log has higher index. Receiver: %d, Sender: %d",
-				lastReceiverIndex, lastSenderIndex)
+					lastReceiverIndex, lastSenderIndex)
 
 				s.stateMutex.Unlock()
 				responseFunc(false)
@@ -685,7 +694,7 @@ func newElectionTimeout(min time.Duration, max time.Duration) time.Duration {
 	electionTimeoutDiff := max - min
 	electionTimeoutRand := rand.Int63n(electionTimeoutDiff.Nanoseconds())
 	electionTimeoutRandNano := time.Duration(electionTimeoutRand) * time.Nanosecond
-	electionTimeout := max + electionTimeoutRandNano
+	electionTimeout := min + electionTimeoutRandNano
 
 	return electionTimeout
 }

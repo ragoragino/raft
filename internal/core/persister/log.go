@@ -35,6 +35,7 @@ type Entry struct {
 }
 
 type ILogEntryPersister interface {
+	// TODO: AppendLogs could maybe take []*CommandLog
 	AppendLogs(logs []*Entry) error
 	GetLastLog() *CommandLog
 	FindLogByIndex(index uint64) (*CommandLog, error)
@@ -56,13 +57,12 @@ type LevelDBLogEntryPersister struct {
 func NewLevelDBLogEntryPersister(logger *logrus.Entry, filePath string) *LevelDBLogEntryPersister {
 	db, err := leveldb.OpenFile(filePath, nil)
 	if leveldb_errors.IsCorrupted(err) {
-		var err error
 		db, err = leveldb.RecoverFile(filePath, nil)
 		if err != nil {
-			logger.Panicf("LevelDB could not recover file: %+v", err)
+			logger.Panicf("LevelDB could not recover file at %s: %+v", filePath, err)
 		}
 	} else if err != nil {
-		logger.Panicf("LevelDB could not open file: %+v", err)
+		logger.Panicf("LevelDB could not open file at %s: %+v", filePath, err)
 	}
 
 	value, err := db.Get([]byte(lastLogDbKey), nil)
@@ -73,28 +73,12 @@ func NewLevelDBLogEntryPersister(logger *logrus.Entry, filePath string) *LevelDB
 			lastCommandLog: nil,
 		}
 	} else if err != nil {
-		logger.Panicf("LevelDB getting state failed: %+v", err)
+		logger.Panicf("LevelDB getting last index failed: %+v", err)
 	}
 
-	lastKnownIndex := binary.LittleEndian.Uint64(value)
-
-	for {
-		_, err := db.Get([]byte(value), nil)
-		if err == leveldb_errors.ErrNotFound {
-			lastKnownIndex--
-			break
-		} else if err != nil {
-			logger.Panicf("LevelDB getting index %+v failed: %+v", value, err)
-		}
-
-		lastKnownIndex++
-		binary.LittleEndian.PutUint64(value, lastKnownIndex)
-	}
-
-	binary.LittleEndian.PutUint64(value, lastKnownIndex)
 	lastCommandLogMarshalled, err := db.Get([]byte(value), nil)
 	if err != nil {
-		logger.Panicf("LevelDB getting index %+v failed: %+v", value, err)
+		logger.Panicf("LevelDB getting last index value %+v failed: %+v", value, err)
 	}
 
 	lastCommandLog := CommandLog{}
@@ -213,14 +197,14 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	if index == firstLevelDBLogIndex+1 {
 		lastCommandLog = nil
 	} else {
-		lastCommandEntry, err := l.FindLogByIndex(index - 1)
+		lastCommandLogFound, err := l.FindLogByIndex(index - 1)
 		if err != nil {
 			return err
 		}
 
 		lastCommandLog = &CommandLog{
-			Index: lastCommandEntry.Index,
-			Entry: lastCommandEntry.Entry,
+			Index: lastCommandLogFound.Index,
+			Entry: lastCommandLogFound.Entry,
 		}
 	}
 
