@@ -89,7 +89,7 @@ func (l *LevelDBStateLogger) GetState() *State {
 	defer l.stateMutex.RUnlock()
 
 	if l.state == nil {
-		return nil 
+		return nil
 	}
 
 	// Make a copy so that client won't modify the member

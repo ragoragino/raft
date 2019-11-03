@@ -1,15 +1,15 @@
 package node
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"os/exec"
-	"runtime"
-	"context"
 
 	"github.com/Shopify/toxiproxy/client"
 	logrus "github.com/sirupsen/logrus"
@@ -67,20 +67,32 @@ func TestLeaderElected(t *testing.T) {
 		"Node2": "localhost:10002",
 	}
 
-	clusters := make(map[string]*Cluster, len(endpoints))
+	// Setup cluster clients for RAFT
+	clusterClients := make(map[string]*Cluster, len(endpoints))
 	for name := range endpoints {
 		logger := logger.WithFields(logrus.Fields{
-			"node": name,
+			"component": "cluster",
+			"node":      name,
 		})
 
-		clusters[name] = NewCluster(logger)
+		clusterClients[name] = NewCluster(logger)
 	}
 
-	// Start servers
-	servers := make([]*Server, 0, len(endpoints))
+	// Start Raft handlers and cluster server
+	rafts := make([]*Raft, 0, len(endpoints))
+	clusterServers := make([]*ClusterServer, 0, len(endpoints))
 	for name, endpoint := range endpoints {
+		serverLogger := logger.WithFields(logrus.Fields{
+			"component": "server",
+			"node":      name,
+		})
+
+		clusterServer := NewClusterServer(serverLogger, WithEndpoint(endpoint))
+		clusterServers = append(clusterServers, clusterServer)
+
 		nodeLogger := logger.WithFields(logrus.Fields{
-			"node": name,
+			"component": "raft",
+			"node":      name,
 		})
 
 		fileStatePath := fmt.Sprintf("db_node_test_TestLeaderElected_State_%s.txt", name)
@@ -96,12 +108,22 @@ func TestLeaderElected(t *testing.T) {
 		stateHandler := NewStateManager(startingStateInfo, fileStateLogger)
 		logHandler := NewLogEntryManager(fileLogLogger)
 
-		servers = append(servers, NewServer(clusters[name], nodeLogger, stateHandler, logHandler,
-			WithServerID(name), WithEndpoint(endpoint)))
+		rafts = append(rafts, NewRaft(clusterClients[name], nodeLogger, stateHandler, logHandler,
+			clusterServer, WithServerID(name)))
 	}
 
-	// Start clusters
-	for name, cluster := range clusters {
+	// Start servers
+	wgServer := sync.WaitGroup{}
+	wgServer.Add(len(clusterServers))
+	for _, clusterServer := range clusterServers {
+		go func(clusterServer *ClusterServer) {
+			defer wgServer.Done()
+			clusterServer.Run()
+		}(clusterServer)
+	}
+
+	// Start client clusters
+	for name, clusterClient := range clusterClients {
 		clusterEndpoints := map[string]string{}
 		for clusterName, clusterEndpoint := range endpoints {
 			if clusterName == name {
@@ -110,43 +132,49 @@ func TestLeaderElected(t *testing.T) {
 			clusterEndpoints[clusterName] = clusterEndpoint
 		}
 
-		err := cluster.StartCluster(clusterEndpoints)
+		err := clusterClient.StartCluster(clusterEndpoints)
 		assert.NoError(t, err)
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(servers))
-	for _, server := range servers {
-		go func(server *Server) {
-			defer wg.Done()
-			server.Run()
-		}(server)
+	// Start Raft instances
+	wgRaft := sync.WaitGroup{}
+	wgRaft.Add(len(rafts))
+	for _, raft := range rafts {
+		go func(raft *Raft) {
+			defer wgRaft.Done()
+			raft.Run()
+		}(raft)
 	}
 
 	// Check if leader was elected
-	timeToLeader := defaultServerOptions.MaxElectionTimeout + defaultServerOptions.MinElectionTimeout
+	timeToLeader := defaultRaftOptions.MaxElectionTimeout + defaultRaftOptions.MinElectionTimeout
 	time.Sleep(timeToLeader * 2)
 
 	leaderExists := false
-	for _, server := range servers {
-		server.stateMutex.RLock()
-		if server.stateManager.GetRole() == LEADER {
+	for _, raft := range rafts {
+		raft.stateMutex.RLock()
+		if raft.stateManager.GetRole() == LEADER {
 			leaderExists = true
 		}
-		server.stateMutex.RUnlock()
+		raft.stateMutex.RUnlock()
 	}
 	assert.True(t, leaderExists)
 
-	// Close clusters and servers down
-	for _, server := range servers {
-		server.Close()
+	// Close servers, Raft instances and cluster clients down
+	for _, clusterServer := range clusterServers {
+		clusterServer.Close()
 	}
 
-	for _, cluster := range clusters {
-		cluster.Close()
+	for _, raft := range rafts {
+		raft.Close()
 	}
 
-	wg.Wait()
+	for _, clusterClients := range clusterClients {
+		clusterClients.Close()
+	}
+
+	wgServer.Wait()
+	wgRaft.Wait()
 }
 
 func createProxy(t *testing.T, endpoints map[string]string, clusterEndpoints map[string]map[string]string) *toxiproxy.Client {
@@ -176,7 +204,7 @@ func startProxyServer(t *testing.T) (*exec.Cmd, func()) {
 	}
 
 	if _, err := os.Stat(toxiProxyBinaryPath); os.IsNotExist(err) {
-		t.Fatalf("toxiproxy server binary is missing")	
+		t.Fatalf("toxiproxy server binary is missing")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -223,20 +251,30 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 		proxyCmd.Wait()
 	}()
 
-	clusters := make(map[string]*Cluster, len(endpoints))
+	clusterClients := make(map[string]*Cluster, len(endpoints))
 	for name := range endpoints {
 		logger := logger.WithFields(logrus.Fields{
-			"node": name,
+			"component": "cluster",
+			"node":      name,
 		})
 
-		clusters[name] = NewCluster(logger)
+		clusterClients[name] = NewCluster(logger)
 	}
 
 	// Start servers
-	servers := make(map[string]*Server, len(endpoints))
+	clusterServers := make(map[string]*ClusterServer, len(endpoints))
+	rafts := make(map[string]*Raft, len(endpoints))
 	for name, endpoint := range endpoints {
+		serverLogger := logger.WithFields(logrus.Fields{
+			"component": "server",
+			"node":      name,
+		})
+
+		clusterServers[name] = NewClusterServer(serverLogger, WithEndpoint(endpoint))
+
 		nodeLogger := logger.WithFields(logrus.Fields{
-			"node": name,
+			"component": "raft",
+			"node":      name,
 		})
 
 		fileStatePath := fmt.Sprintf("db_node_test_TestLeaderElectedAfterPartition_State_%s.txt", name)
@@ -252,38 +290,47 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 		stateHandler := NewStateManager(startingStateInfo, fileStateLogger)
 		logHandler := NewLogEntryManager(fileLogLogger)
 
-		servers[name] = NewServer(clusters[name], nodeLogger, stateHandler, logHandler,
-			WithServerID(name), WithEndpoint(endpoint))
+		rafts[name] = NewRaft(clusterClients[name], nodeLogger, stateHandler, logHandler,
+			clusterServers[name], WithServerID(name))
 	}
 
-	// Start clusters
-	for name, cluster := range clusters {
-		err := cluster.StartCluster(clusterProxyEndpoints[name])
+	wgServer := sync.WaitGroup{}
+	wgServer.Add(len(clusterServers))
+	for _, clusterServer := range clusterServers {
+		go func(clusterServer *ClusterServer) {
+			defer wgServer.Done()
+			clusterServer.Run()
+		}(clusterServer)
+	}
+
+	// Start clusters clients for RAFT instances
+	for name, clusterClient := range clusterClients {
+		err := clusterClient.StartCluster(clusterProxyEndpoints[name])
 		assert.NoError(t, err)
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(servers))
-	for _, server := range servers {
-		go func(server *Server) {
-			defer wg.Done()
-			server.Run()
-		}(server)
+	wgRaft := sync.WaitGroup{}
+	wgRaft.Add(len(rafts))
+	for _, raft := range rafts {
+		go func(raft *Raft) {
+			defer wgRaft.Done()
+			raft.Run()
+		}(raft)
 	}
 
 	// Check if leader was elected
-	timeToLeader := defaultServerOptions.MaxElectionTimeout + defaultServerOptions.MinElectionTimeout
+	timeToLeader := defaultRaftOptions.MaxElectionTimeout + defaultRaftOptions.MinElectionTimeout
 	time.Sleep(timeToLeader * 2)
 
 	oldLeaderExists := false
 	oldLeaderID := ""
-	for _, server := range servers {
-		server.stateMutex.RLock()
-		if server.stateManager.GetRole() == LEADER {
+	for _, raft := range rafts {
+		raft.stateMutex.RLock()
+		if raft.stateManager.GetRole() == LEADER {
 			oldLeaderExists = true
-			oldLeaderID = server.settings.ID
+			oldLeaderID = raft.settings.ID
 		}
-		server.stateMutex.RUnlock()
+		raft.stateMutex.RUnlock()
 	}
 	assert.True(t, oldLeaderExists)
 
@@ -305,13 +352,13 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 
 	newLeaderExists := false
 	newLeaderID := ""
-	for _, server := range servers {
-		server.stateMutex.RLock()
-		if server.stateManager.GetRole() == LEADER && server.settings.ID != oldLeaderID {
+	for _, raft := range rafts {
+		raft.stateMutex.RLock()
+		if raft.stateManager.GetRole() == LEADER && raft.settings.ID != oldLeaderID {
 			newLeaderExists = true
-			newLeaderID = server.settings.ID
+			newLeaderID = raft.settings.ID
 		}
-		server.stateMutex.RUnlock()
+		raft.stateMutex.RUnlock()
 	}
 	assert.True(t, newLeaderExists)
 
@@ -332,16 +379,21 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 	// Increase the sleep a bit due to proxies restarting
 	time.Sleep(timeToLeader * 3)
 
-	assert.Equal(t, clusters[oldLeaderID].GetClusterState().leaderName, newLeaderID)
+	assert.Equal(t, clusterClients[oldLeaderID].GetClusterState().leaderName, newLeaderID)
 
-	// Close clusters and servers down
-	for _, server := range servers {
-		server.Close()
+	// Close servers, Raft instances and cluster clients down
+	for _, clusterServer := range clusterServers {
+		clusterServer.Close()
 	}
 
-	for _, cluster := range clusters {
-		cluster.Close()
+	for _, raft := range rafts {
+		raft.Close()
 	}
 
-	wg.Wait()
+	for _, clusterClient := range clusterClients {
+		clusterClient.Close()
+	}
+
+	wgServer.Wait()
+	wgRaft.Wait()
 }

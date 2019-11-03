@@ -11,20 +11,20 @@ import (
 )
 
 type clusterOptions struct {
-	defaultRPCRequestTimeout time.Duration
+	connectionDialTimeout time.Duration
 }
 
 var (
 	defaultClusterOptions = clusterOptions{
-		defaultRPCRequestTimeout: 5 * time.Second,
+		connectionDialTimeout: 15 * time.Second,
 	}
 )
 
 type ClusterCallOption func(opt *clusterOptions)
 
-func WithDefaultRPCRequestTimeout(timeout time.Duration) ClusterCallOption {
+func WithConnectionDialTimeout(timeout time.Duration) ClusterCallOption {
 	return func(opt *clusterOptions) {
-		opt.defaultRPCRequestTimeout = timeout
+		opt.connectionDialTimeout = timeout
 	}
 }
 
@@ -84,8 +84,11 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 
 	nodes := make([]*NodeInfo, 0, len(otherNodes))
 
+	ctx, cancel := context.WithTimeout(context.Background(), c.settings.connectionDialTimeout)
+	defer cancel()
+
 	for name, endpoint := range otherNodes {
-		conn, err := grpc.Dial(endpoint, grpc.WithInsecure(), grpc.WithAuthority(endpoint),
+		conn, err := grpc.DialContext(ctx, endpoint, grpc.WithInsecure(), grpc.WithAuthority(endpoint),
 			grpc.WithBlock())
 		if err != nil {
 			for _, node := range nodes {
@@ -163,8 +166,6 @@ func (c *Cluster) BroadcastRequestVoteRPCs(ctx context.Context, request *pb.Requ
 	wg := sync.WaitGroup{}
 	wg.Add(len(c.nodes))
 
-	ctx, cancel := context.WithTimeout(ctx, c.settings.defaultRPCRequestTimeout)
-	defer cancel()
 	for _, node := range c.nodes {
 		go func(node *NodeInfo) {
 			defer wg.Done()
@@ -200,8 +201,6 @@ func (c *Cluster) BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.Ap
 	wg := sync.WaitGroup{}
 	wg.Add(len(c.nodes))
 
-	ctx, cancel := context.WithTimeout(ctx, c.settings.defaultRPCRequestTimeout)
-	defer cancel()
 	for _, node := range c.nodes {
 		go func(node *NodeInfo) {
 			defer wg.Done()

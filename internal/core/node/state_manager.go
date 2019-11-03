@@ -9,7 +9,7 @@ import (
 type StateInfo struct {
 	CurrentTerm uint64
 	VotedFor    *string
-	Role        ServerRole
+	Role        RaftRole
 }
 
 type StateSwitched struct {
@@ -23,8 +23,8 @@ type IStateManager interface {
 
 	GetCurrentTerm() uint64
 	GetVotedFor() *string
-	GetRole() ServerRole
-	SwitchState(term uint64, votedFor *string, role ServerRole)
+	GetRole() RaftRole
+	SwitchState(term uint64, votedFor *string, role RaftRole)
 }
 
 type StateManager struct {
@@ -76,11 +76,11 @@ func (s *StateManager) GetVotedFor() *string {
 	return s.statePersister.GetState().VotedFor
 }
 
-func (s *StateManager) GetRole() ServerRole {
+func (s *StateManager) GetRole() RaftRole {
 	return s.info.Role
 }
 
-func (s *StateManager) SwitchState(term uint64, votedFor *string, role ServerRole) {
+func (s *StateManager) SwitchState(term uint64, votedFor *string, role RaftRole) {
 	oldInfo := s.info
 
 	s.statePersister.UpdateState(&persister.State{
