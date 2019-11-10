@@ -5,6 +5,7 @@ import (
 	"fmt"
 	logrus "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"math/rand"
 	pb "raft/internal/core/node/gen"
 	"sync"
 	"time"
@@ -137,6 +138,12 @@ func (c *Cluster) GetClusterState() ClusterState {
 	if c.leader != nil {
 		leaderName = c.leader.name
 		leaderEndpoint = c.leader.endpoint
+	} else {
+		// Get a random node
+		randomIndex := rand.Intn(len(c.nodex))
+		leader := c.nodes[randomIndex]
+		leaderName = leader.name
+		leaderEndpoint = leader.endpoint
 	}
 
 	return ClusterState{
