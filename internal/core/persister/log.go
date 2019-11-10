@@ -7,17 +7,19 @@ import (
 	logrus "github.com/sirupsen/logrus"
 	"github.com/syndtr/goleveldb/leveldb"
 	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/syndtr/goleveldb/leveldb/util"
 	"sync"
 )
 
 const (
+	// First DB Index - must be always empty
+	firstLevelDBLogIndex = 0
+
 	// We will use lastLogDbKey to track which log entry is currently at the end.
 	// In case our node crashes, we just have to get the index inserted in
 	// lastLogDbKey and find the highest index present in the DB higher or equal to that.
-	lastLogDbKey = "last_log"
-
-	// First DB Index - will be always empty
-	firstLevelDBLogIndex = 0
+	// TODO: Maybe save it in a separate DB???
+	lastLogDbKey = firstLevelDBLogIndex
 )
 
 var (
@@ -40,6 +42,7 @@ type ILogEntryPersister interface {
 	GetLastLog() *CommandLog
 	FindLogByIndex(index uint64) (*CommandLog, error)
 	DeleteLogsAferIndex(index uint64) error
+	Replay(doneChannel <-chan struct{}, writeChannel chan<- CommandLog) error
 	Close()
 }
 
@@ -65,7 +68,9 @@ func NewLevelDBLogEntryPersister(logger *logrus.Entry, filePath string) *LevelDB
 		logger.Panicf("LevelDB could not open file at %s: %+v", filePath, err)
 	}
 
-	value, err := db.Get([]byte(lastLogDbKey), nil)
+	buffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buffer, lastLogDbKey)
+	value, err := db.Get(buffer, nil)
 	if err == leveldb_errors.ErrNotFound {
 		return &LevelDBLogEntryPersister{
 			db:             db,
@@ -76,7 +81,7 @@ func NewLevelDBLogEntryPersister(logger *logrus.Entry, filePath string) *LevelDB
 		logger.Panicf("LevelDB getting last index failed: %+v", err)
 	}
 
-	lastCommandLogMarshalled, err := db.Get([]byte(value), nil)
+	lastCommandLogMarshalled, err := db.Get(value, nil)
 	if err != nil {
 		logger.Panicf("LevelDB getting last index value %+v failed: %+v", value, err)
 	}
@@ -113,9 +118,13 @@ func (l *LevelDBLogEntryPersister) GetLastLog() *CommandLog {
 }
 
 func (l *LevelDBLogEntryPersister) FindLogByIndex(index uint64) (*CommandLog, error) {
+	if index <= firstLevelDBLogIndex {
+		return nil, ErrIndexedLogDoesNotExists
+	}
+
 	buffer := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buffer, index)
-	commandLogMarshalled, err := l.db.Get([]byte(buffer), nil)
+	commandLogMarshalled, err := l.db.Get(buffer, nil)
 	if err == leveldb_errors.ErrNotFound {
 		return nil, ErrIndexedLogDoesNotExists
 	} else if err != nil {
@@ -161,7 +170,9 @@ func (l *LevelDBLogEntryPersister) AppendLogs(logs []*Entry) error {
 		batch.Put(indexBuffer, commandLogMarshalled)
 
 		if i == (len(logs) - 1) {
-			batch.Put([]byte(lastLogDbKey), indexBuffer)
+			lastLogDbKeyBuffer := make([]byte, 8)
+			binary.LittleEndian.PutUint64(lastLogDbKeyBuffer, lastLogDbKey)
+			batch.Put(lastLogDbKeyBuffer, indexBuffer)
 		}
 	}
 
@@ -217,7 +228,11 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	}
 
 	binary.LittleEndian.PutUint64(indexBuffer, lastCommandLog.Index)
-	batch.Put([]byte(lastLogDbKey), indexBuffer)
+
+	lastLogDbKeyBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(lastLogDbKeyBuffer, lastLogDbKey)
+
+	batch.Put(lastLogDbKeyBuffer, indexBuffer)
 
 	err := l.db.Write(batch, nil)
 	if err != nil {
@@ -227,4 +242,46 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	l.lastCommandLog = lastCommandLog
 
 	return nil
+}
+
+func (l *LevelDBLogEntryPersister) Replay(doneChannel <-chan struct{}, writeChannel chan<- CommandLog) error {
+	l.lastCommandLogLock.RLock()
+	defer l.lastCommandLogLock.RUnlock()
+
+	var firstIndex uint64 = firstLevelDBLogIndex + uint64(1)
+	var lastIndex uint64 = firstLevelDBLogIndex + uint64(1)
+	if l.lastCommandLog == nil {
+		return ErrIndexedLogDoesNotExists
+	}
+
+	lastIndex = l.lastCommandLog.Index
+
+	firstIndexBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(firstIndexBuffer, firstIndex)
+
+	lastIndexBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(lastIndexBuffer, lastIndex)
+
+	iter := l.db.NewIterator(&util.Range{Start: firstIndexBuffer, Limit: lastIndexBuffer}, nil)
+	for {
+		select {
+		case <-doneChannel:
+			iter.Release()
+			return nil
+		default:
+			iter.Next()
+			value := iter.Value()
+			commandLogUnmarshalled := CommandLog{}
+			err := json.Unmarshal(value, &commandLogUnmarshalled)
+			if err != nil {
+				iter.Release()
+				return err
+			}
+
+			writeChannel <- commandLogUnmarshalled
+		}
+	}
+
+	iter.Release()
+	return iter.Error()
 }

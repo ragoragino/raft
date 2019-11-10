@@ -81,7 +81,7 @@ type ExternalServer struct {
 	logger                *logrus.Entry
 }
 
-func NewExternalServer(endpoint string, logger *logrus.Entry) *ExternalServer {
+func New(endpoint string, logger *logrus.Entry) *ExternalServer {
 	externalServer := &ExternalServer{
 		logger: logger,
 	}

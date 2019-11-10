@@ -20,7 +20,7 @@ func TestHandlersCreate(t *testing.T) {
 		TimestampFormat: time.RFC3339Nano,
 	})
 
-	server := NewExternalServer("localhost:80", logger.WithFields(logrus.Fields{
+	server := New("localhost:80", logger.WithFields(logrus.Fields{
 		"component": "server",
 	}))
 	ch, err := server.GetRequestChannel()
@@ -30,10 +30,10 @@ func TestHandlersCreate(t *testing.T) {
 
 	testCases := []struct {
 		name                   string
-		clientCreateRequest ClientCreateRequest
+		clientCreateRequest    ClientCreateRequest
 		clusterResponse        ClusterCreateResponse
 		expectedClusterRequest *ClusterCreateRequest
-		expectedStatusCode int
+		expectedStatusCode     int
 	}{
 		{
 			name: "ok",
@@ -89,7 +89,7 @@ func TestHandlersCreate(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			buffer, err := json.Marshal(testCase.clientCreateRequest)
 			assert.NoError(t, err)
-		
+
 			reader := bytes.NewReader(buffer)
 			req, err := http.NewRequest("POST", "/create", reader)
 			assert.NoError(t, err)
@@ -117,7 +117,7 @@ func TestHandlersGet(t *testing.T) {
 		TimestampFormat: time.RFC3339Nano,
 	})
 
-	server := NewExternalServer("localhost:80", logger.WithFields(logrus.Fields{
+	server := New("localhost:80", logger.WithFields(logrus.Fields{
 		"component": "server",
 	}))
 	ch, err := server.GetRequestChannel()
@@ -127,29 +127,29 @@ func TestHandlersGet(t *testing.T) {
 
 	testCases := []struct {
 		name                   string
-		clientGetRequest ClientGetRequest
+		clientGetRequest       ClientGetRequest
 		clusterResponse        ClusterGetResponse
 		expectedClusterRequest *ClusterGetRequest
-		expectedStatusCode int
+		expectedStatusCode     int
 	}{
 		{
 			name: "ok",
 			clientGetRequest: ClientGetRequest{
-				Key:   "key",
+				Key: "key",
 			},
 			clusterResponse: ClusterGetResponse{
 				StatusCode: Ok,
-				Value: []byte("value"),
+				Value:      []byte("value"),
 			},
 			expectedClusterRequest: &ClusterGetRequest{
-				Key:   "key",
+				Key: "key",
 			},
 			expectedStatusCode: http.StatusOK,
 		},
 		{
 			name: "redirect",
 			clientGetRequest: ClientGetRequest{
-				Key:   "key",
+				Key: "key",
 			},
 			clusterResponse: ClusterGetResponse{
 				StatusCode: Redirect,
@@ -158,20 +158,20 @@ func TestHandlersGet(t *testing.T) {
 				},
 			},
 			expectedClusterRequest: &ClusterGetRequest{
-				Key:   "key",
+				Key: "key",
 			},
 			expectedStatusCode: http.StatusFound,
 		},
 		{
 			name: "failed",
 			clientGetRequest: ClientGetRequest{
-				Key:   "key",
+				Key: "key",
 			},
 			clusterResponse: ClusterGetResponse{
 				StatusCode: Failed,
 			},
 			expectedClusterRequest: &ClusterGetRequest{
-				Key:   "key",
+				Key: "key",
 			},
 			expectedStatusCode: http.StatusInternalServerError,
 		},
@@ -181,7 +181,7 @@ func TestHandlersGet(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			buffer, err := json.Marshal(testCase.clientGetRequest)
 			assert.NoError(t, err)
-		
+
 			reader := bytes.NewReader(buffer)
 			req, err := http.NewRequest("POST", "/create", reader)
 			assert.NoError(t, err)

@@ -140,7 +140,7 @@ func (c *Cluster) GetClusterState() ClusterState {
 		leaderEndpoint = c.leader.endpoint
 	} else {
 		// Get a random node
-		randomIndex := rand.Intn(len(c.nodex))
+		randomIndex := rand.Intn(len(c.nodes))
 		leader := c.nodes[randomIndex]
 		leaderName = leader.name
 		leaderEndpoint = leader.endpoint

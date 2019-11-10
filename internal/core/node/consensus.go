@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	pb "raft/internal/core/node/gen"
 	"raft/internal/core/persister"
+	external_server "raft/internal/core/server"
 	"sync"
 	"time"
 )
@@ -86,6 +87,11 @@ func (s RaftRole) String() string {
 	return ""
 }
 
+type clientLog struct {
+	Key   string
+	Value []byte
+}
+
 type appendEntriesEvent struct {
 	byLeader bool
 }
@@ -99,6 +105,7 @@ type Raft struct {
 	cluster            ICluster
 	stateManager       IStateManager
 	logManager         ILogEntryManager
+	stateMachine       IStateMachine
 	stateMutex         sync.RWMutex
 	logger             *logrus.Entry
 	closeChannel       chan struct{}
@@ -109,19 +116,27 @@ type Raft struct {
 
 	appendEntriesProcessChannel <-chan appendEntriesProcessRequest
 	requestVoteProcessChannel   <-chan requestVoteProcessRequest
+
+	clientRequestChannel <-chan external_server.ClusterRequestWrapper
 }
 
 func NewRaft(cluster ICluster, logger *logrus.Entry, stateManager IStateManager,
-	logManager ILogEntryManager, server IClusterServer, opts ...RaftCallOption) *Raft {
+	logManager ILogEntryManager, stateMachine IStateMachine, clusterServer IClusterServer,
+	externelServer external_server.IExternalServer, opts ...RaftCallOption) *Raft {
 
-	appendEntriesProcessChannel, err := server.GetAppendEntriesChannel()
+	appendEntriesProcessChannel, err := clusterServer.GetAppendEntriesChannel()
 	if err != nil {
-		logger.Panicf("unable to obtain server channel: %+v", err)
+		logger.Panicf("unable to obtain cluster server channel: %+v", err)
 	}
 
-	requestVoteProcessChannel, err := server.GetRequestVoteChannel()
+	requestVoteProcessChannel, err := clusterServer.GetRequestVoteChannel()
 	if err != nil {
-		logger.Panicf("unable to obtain server channel: %+v", err)
+		logger.Panicf("unable to obtain cluster server channel: %+v", err)
+	}
+
+	clientRequestChannel, err := externelServer.GetRequestChannel()
+	if err != nil {
+		logger.Panicf("unable to obtain external server channel: %+v", err)
 	}
 
 	raft := &Raft{
@@ -130,12 +145,14 @@ func NewRaft(cluster ICluster, logger *logrus.Entry, stateManager IStateManager,
 		logger:                       logger,
 		stateManager:                 stateManager,
 		logManager:                   logManager,
+		stateMachine:                 stateMachine,
 		closeChannel:                 make(chan struct{}),
 		runFinishedChannel:           make(chan struct{}),
 		appendEntriesHandlersChannel: make(chan appendEntriesEvent),
 		requestVoteHandlersChannel:   make(chan requestVoteEvent),
 		appendEntriesProcessChannel:  appendEntriesProcessChannel,
 		requestVoteProcessChannel:    requestVoteProcessChannel,
+		clientRequestChannel:         clientRequestChannel,
 	}
 
 	return raft
@@ -151,6 +168,7 @@ func (r *Raft) Run() {
 
 	appendEntriesProcessingEndChannel := r.processAppendEntries(r.closeChannel)
 	requestVoteProcessingEndChannel := r.processRequestVote(r.closeChannel)
+	clientEndChannel := r.processClientRequests(r.closeChannel)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	doneChannel := r.HandleRoleFollower(ctx, stateChangedChannel)
@@ -166,6 +184,7 @@ func (r *Raft) Run() {
 			<-doneChannel
 			<-appendEntriesProcessingEndChannel
 			<-requestVoteProcessingEndChannel
+			<-clientEndChannel
 			close(r.runFinishedChannel)
 			return
 		}
@@ -655,6 +674,95 @@ func (r *Raft) processRequestVote(done <-chan struct{}) <-chan struct{} {
 	}()
 
 	return finishChannel
+}
+
+func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
+	finishChannel := make(chan struct{})
+	go func() {
+	processLoop:
+		for {
+			select {
+			case msg := <-r.clientRequestChannel:
+				switch request := msg.Request.(type) {
+				case external_server.ClusterCreateRequest:
+					responseChannel := msg.ResponseChannel
+
+					r.stateMutex.RLock()
+					role := r.stateManager.GetRole()
+					if role != LEADER {
+						r.stateMutex.RUnlock()
+
+						clusterState := r.cluster.GetClusterState()
+
+						responseChannel <- external_server.ClusterCreateResponse{
+							StatusCode: external_server.Redirect,
+							Message: external_server.ClusterMessage{
+								Address: clusterState.leaderEndpoint,
+							},
+						}
+					}
+					r.stateMutex.RUnlock()
+
+					statusCode := external_server.Ok
+					err := r.processClientCreateRequest(request)
+					if err != nil {
+						statusCode = external_server.Failed
+					}
+
+					responseChannel <- external_server.ClusterCreateResponse{
+						StatusCode: statusCode,
+					}
+				case external_server.ClusterGetRequest:
+					responseChannel := msg.ResponseChannel
+
+					r.stateMutex.RLock()
+					role := r.stateManager.GetRole()
+					if role != LEADER {
+						r.stateMutex.RUnlock()
+
+						clusterState := r.cluster.GetClusterState()
+
+						responseChannel <- external_server.ClusterGetResponse{
+							StatusCode: external_server.Redirect,
+							Message: external_server.ClusterMessage{
+								Address: clusterState.leaderEndpoint,
+							},
+						}
+					}
+					r.stateMutex.RUnlock()
+
+					statusCode := external_server.Ok
+					value, err := r.processClientGetRequest(request)
+					if err != nil {
+						statusCode = external_server.Failed
+					}
+
+					responseChannel <- external_server.ClusterGetResponse{
+						StatusCode: statusCode,
+						Value:      value,
+					}
+				default:
+					r.logger.Panicf("received unknown HTTP request: %+v", request)
+				}
+			case <-done:
+				break processLoop
+			}
+		}
+
+		close(finishChannel)
+	}()
+
+	return finishChannel
+}
+
+func (r *Raft) processClientCreateRequest(request external_server.ClusterCreateRequest) error {
+	// TODO: Implement
+	return nil
+}
+
+func (r *Raft) processClientGetRequest(request external_server.ClusterGetRequest) ([]byte, error) {
+	// TODO: Implement
+	return nil, nil
 }
 
 func newElectionTimeout(min time.Duration, max time.Duration) time.Duration {

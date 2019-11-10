@@ -15,6 +15,7 @@ import (
 	logrus "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"raft/internal/core/persister"
+	external_server "raft/internal/core/server"
 )
 
 var (
@@ -108,8 +109,21 @@ func TestLeaderElected(t *testing.T) {
 		stateHandler := NewStateManager(startingStateInfo, fileStateLogger)
 		logHandler := NewLogEntryManager(fileLogLogger)
 
+		// TODO
+		stateMachineLogger := logger.WithFields(logrus.Fields{
+			"component": "stateMachine",
+			"node":      name,
+		})
+		stateMachine := NewStateMachine(stateMachineLogger)
+		
+		externalServerLogger := logger.WithFields(logrus.Fields{
+			"component": "httpServer",
+			"node":      name,
+		})
+		externalServer := external_server.New("localhost:80", externalServerLogger)
+
 		rafts = append(rafts, NewRaft(clusterClients[name], nodeLogger, stateHandler, logHandler,
-			clusterServer, WithServerID(name)))
+			stateMachine, clusterServer, externalServer, WithServerID(name)))
 	}
 
 	// Start servers
@@ -290,8 +304,21 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 		stateHandler := NewStateManager(startingStateInfo, fileStateLogger)
 		logHandler := NewLogEntryManager(fileLogLogger)
 
+		// TODO
+		stateMachineLogger := logger.WithFields(logrus.Fields{
+			"component": "stateMachine",
+			"node":      name,
+		})
+		stateMachine := NewStateMachine(stateMachineLogger)
+			
+		externalServerLogger := logger.WithFields(logrus.Fields{
+			"component": "httpServer",
+			"node":      name,
+		})
+		externalServer := external_server.New("localhost:80", externalServerLogger)
+
 		rafts[name] = NewRaft(clusterClients[name], nodeLogger, stateHandler, logHandler,
-			clusterServers[name], WithServerID(name))
+			stateMachine, clusterServers[name], externalServer, WithServerID(name))
 	}
 
 	wgServer := sync.WaitGroup{}
