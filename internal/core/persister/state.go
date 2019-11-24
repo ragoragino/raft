@@ -23,9 +23,7 @@ type IStateLogger interface {
 	Close()
 }
 
-// LevelDBStateLogger is safe for concurrent usage,
-// although we currently don't use it from multiple goroutines
-// because AppendEntries RPC are handled sequentially
+// LevelDBStateLogger is safe for concurrent usage
 type LevelDBStateLogger struct {
 	// leveldb.DB is safe for concurrent usage
 	db         *leveldb.DB

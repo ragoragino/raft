@@ -29,9 +29,10 @@ type ClientGetResponse struct {
 type ClusterStatusCode int
 
 const (
-	Ok       ClusterStatusCode = iota
-	Failed   ClusterStatusCode = iota
-	Redirect ClusterStatusCode = iota
+	Ok             ClusterStatusCode = iota
+	FailedNotFound ClusterStatusCode = iota
+	FailedInternal ClusterStatusCode = iota
+	Redirect       ClusterStatusCode = iota
 )
 
 type ClusterMessage struct {
@@ -51,6 +52,7 @@ type ClusterGetRequest struct {
 }
 
 type ClusterRequestWrapper struct {
+	Context         context.Context
 	Request         ClusterRequest
 	ResponseChannel chan<- ClusterResponse
 }
@@ -143,6 +145,7 @@ func (s *ExternalServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	responseChannel := make(chan ClusterResponse)
 	s.requestProcessChannel <- ClusterRequestWrapper{
+		Context:         r.Context(),
 		Request:         &clusterRequest,
 		ResponseChannel: responseChannel,
 	}
@@ -155,7 +158,7 @@ func (s *ExternalServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		case Ok:
 			w.WriteHeader(http.StatusOK)
 			return
-		case Failed:
+		case FailedInternal:
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		case Redirect:
@@ -181,6 +184,7 @@ func (s *ExternalServer) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	responseChannel := make(chan ClusterResponse)
 	s.requestProcessChannel <- ClusterRequestWrapper{
+		Context:         r.Context(),
 		Request:         &clusterRequest,
 		ResponseChannel: responseChannel,
 	}
@@ -202,8 +206,11 @@ func (s *ExternalServer) handleGet(w http.ResponseWriter, r *http.Request) {
 
 			w.Write(buffer)
 			return
-		case Failed:
+		case FailedInternal:
 			w.WriteHeader(http.StatusInternalServerError)
+			return
+		case FailedNotFound:
+			w.WriteHeader(http.StatusNotFound)
 			return
 		case Redirect:
 			http.Redirect(w, r, responseTyped.Message.Address, http.StatusFound)

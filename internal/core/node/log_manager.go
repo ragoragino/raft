@@ -11,6 +11,7 @@ type ILogEntryManager interface {
 	GetLastLogTerm() uint64
 	FindLogByIndex(index uint64) (*persister.CommandLog, error)
 	DeleteLogsAferIndex(index uint64) error
+	// TODO: Maybe change the type to some neutral type
 	AppendLogs(term uint64, entries []*pb.AppendEntriesRequest_Entry) error
 }
 
@@ -27,7 +28,7 @@ func NewLogEntryManager(entryPersister persister.ILogEntryPersister) *LogEntryMa
 func (l *LogEntryManager) GetLastLogIndex() uint64 {
 	log := l.entryPersister.GetLastLog()
 	if log == nil {
-		return 0
+		return startingLogIndex
 	}
 
 	return log.Index
@@ -36,7 +37,7 @@ func (l *LogEntryManager) GetLastLogIndex() uint64 {
 func (l *LogEntryManager) GetLastLogTerm() uint64 {
 	log := l.entryPersister.GetLastLog()
 	if log == nil {
-		return 0
+		return startingTerm
 	}
 
 	return log.Term

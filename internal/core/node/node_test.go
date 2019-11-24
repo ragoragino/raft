@@ -115,7 +115,7 @@ func TestLeaderElected(t *testing.T) {
 			"node":      name,
 		})
 		stateMachine := NewStateMachine(stateMachineLogger)
-		
+
 		externalServerLogger := logger.WithFields(logrus.Fields{
 			"component": "httpServer",
 			"node":      name,
@@ -310,7 +310,7 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 			"node":      name,
 		})
 		stateMachine := NewStateMachine(stateMachineLogger)
-			
+
 		externalServerLogger := logger.WithFields(logrus.Fields{
 			"component": "httpServer",
 			"node":      name,

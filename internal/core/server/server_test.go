@@ -75,7 +75,7 @@ func TestHandlersCreate(t *testing.T) {
 				Value: []byte("value"),
 			},
 			clusterResponse: ClusterCreateResponse{
-				StatusCode: Failed,
+				StatusCode: FailedInternal,
 			},
 			expectedClusterRequest: &ClusterCreateRequest{
 				Key:   "key",
@@ -168,7 +168,7 @@ func TestHandlersGet(t *testing.T) {
 				Key: "key",
 			},
 			clusterResponse: ClusterGetResponse{
-				StatusCode: Failed,
+				StatusCode: FailedInternal,
 			},
 			expectedClusterRequest: &ClusterGetRequest{
 				Key: "key",

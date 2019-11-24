@@ -11,22 +11,25 @@ import (
 	"raft/internal/core/persister"
 	external_server "raft/internal/core/server"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type raftOptions struct {
-	ID                 string
-	HeartbeatFrequency time.Duration
-	MaxElectionTimeout time.Duration
-	MinElectionTimeout time.Duration
+	ID                         string
+	HeartbeatFrequency         time.Duration
+	MaxElectionTimeout         time.Duration
+	MinElectionTimeout         time.Duration
+	AppendEntryRetryBufferSize int
 }
 
 var (
 	defaultRaftOptions = raftOptions{
-		ID:                 "Node",
-		HeartbeatFrequency: 500 * time.Millisecond,
-		MaxElectionTimeout: 1000 * time.Millisecond,
-		MinElectionTimeout: 750 * time.Millisecond,
+		ID:                         "Node",
+		HeartbeatFrequency:         500 * time.Millisecond,
+		MaxElectionTimeout:         1000 * time.Millisecond,
+		MinElectionTimeout:         750 * time.Millisecond,
+		AppendEntryRetryBufferSize: 100,
 	}
 )
 
@@ -53,6 +56,12 @@ func WithMaxElectionTimeout(timeout time.Duration) RaftCallOption {
 func WithMinElectionTimeout(timeout time.Duration) RaftCallOption {
 	return func(opt *raftOptions) {
 		opt.MinElectionTimeout = timeout
+	}
+}
+
+func WithAppendEntryRetryBufferSize(appendEntryBufferSize uint32) RaftCallOption {
+	return func(opt *raftOptions) {
+		opt.AppendEntryRetryBufferSize = int(appendEntryBufferSize)
 	}
 }
 
@@ -87,6 +96,11 @@ func (s RaftRole) String() string {
 	return ""
 }
 
+const (
+	startingLogIndex = 1
+	startingTerm     = 0
+)
+
 type clientLog struct {
 	Key   string
 	Value []byte
@@ -98,6 +112,12 @@ type appendEntriesEvent struct {
 
 type requestVoteEvent struct {
 	voteGranted bool
+}
+
+type retryNodeAppendEntriesRequest struct {
+	Context         context.Context
+	OriginalRequest *pb.AppendEntriesRequest
+	SuccessCallback func()
 }
 
 type Raft struct {
@@ -118,6 +138,8 @@ type Raft struct {
 	requestVoteProcessChannel   <-chan requestVoteProcessRequest
 
 	clientRequestChannel <-chan external_server.ClusterRequestWrapper
+
+	retryNodeAppendEntriesChannels map[string]chan *retryNodeAppendEntriesRequest
 }
 
 func NewRaft(cluster ICluster, logger *logrus.Entry, stateManager IStateManager,
@@ -166,6 +188,19 @@ func (r *Raft) Run() {
 		close(stateChangedChannel)
 	}()
 
+	clusterState := r.cluster.GetClusterState()
+	endRetryNodeAppendEntriesChannel := make(map[string]<-chan struct{}, len(clusterState.nodes))
+	retryNodeAppendEntriesChannels := make(map[string]chan *retryNodeAppendEntriesRequest, len(clusterState.nodes))
+	for _, node := range clusterState.nodes {
+		retryNodeAppendEntriesChannels[node] = make(chan *retryNodeAppendEntriesRequest, r.settings.AppendEntryRetryBufferSize)
+	}
+
+	r.retryNodeAppendEntriesChannels = retryNodeAppendEntriesChannels
+
+	for _, node := range clusterState.nodes {
+		endRetryNodeAppendEntriesChannel[node] = r.retryNodeAppendEntries(r.closeChannel, node)
+	}
+
 	appendEntriesProcessingEndChannel := r.processAppendEntries(r.closeChannel)
 	requestVoteProcessingEndChannel := r.processRequestVote(r.closeChannel)
 	clientEndChannel := r.processClientRequests(r.closeChannel)
@@ -185,6 +220,10 @@ func (r *Raft) Run() {
 			<-appendEntriesProcessingEndChannel
 			<-requestVoteProcessingEndChannel
 			<-clientEndChannel
+			for nodeID, channel := range endRetryNodeAppendEntriesChannel {
+				<-channel
+				close(retryNodeAppendEntriesChannels[nodeID])
+			}
 			close(r.runFinishedChannel)
 			return
 		}
@@ -368,9 +407,7 @@ func (r *Raft) broadcastRequestVote(ctx context.Context) {
 	}
 
 	// Check if majority reached
-	clusterState := r.cluster.GetClusterState()
-	clusterMajority := int(math.Round(float64(clusterState.numberOfNodes) * 0.5))
-	if countOfVotes > clusterMajority {
+	if r.checkClusterMajority(countOfVotes) {
 		r.stateManager.SwitchState(r.stateManager.GetCurrentTerm(), nil, LEADER)
 	}
 }
@@ -526,21 +563,23 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				}
 
 				index := request.GetPrevLogIndex()
-				log, err := r.logManager.FindLogByIndex(index)
-				if err == persister.ErrIndexedLogDoesNotExists {
-					r.stateMutex.Unlock()
-					responseFunc(true, false)
-					continue
-				} else if err != nil {
-					r.stateMutex.Unlock()
-					logger.Panicf("unable to find log by index %d: %+v", index, err)
-				}
-
-				if log.Term != request.GetPrevLogTerm() {
-					err := r.logManager.DeleteLogsAferIndex(index)
-					if err != nil {
+				if index >= startingLogIndex-1 {
+					log, err := r.logManager.FindLogByIndex(index)
+					if err == persister.ErrIndexedLogDoesNotExists {
 						r.stateMutex.Unlock()
-						logger.Panicf("unable to delete log after index %d: %+v", index, err)
+						responseFunc(true, false)
+						continue
+					} else if err != nil {
+						r.stateMutex.Unlock()
+						logger.Panicf("unable to find log by index %d: %+v", index, err)
+					}
+
+					if log.Term != request.GetPrevLogTerm() {
+						err := r.logManager.DeleteLogsAferIndex(index)
+						if err != nil {
+							r.stateMutex.Unlock()
+							logger.Panicf("unable to delete log after index %d: %+v", index, err)
+						}
 					}
 				}
 
@@ -558,7 +597,6 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				logger.Debugf("sending accept response")
 
 				responseFunc(true, true)
-
 			case <-done:
 				break processLoop
 			}
@@ -681,17 +719,15 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 	go func() {
 	processLoop:
 		for {
+			// TODO: Allow get request processing while processing Create, Update or Delete
 			select {
 			case msg := <-r.clientRequestChannel:
 				switch request := msg.Request.(type) {
 				case external_server.ClusterCreateRequest:
 					responseChannel := msg.ResponseChannel
 
-					r.stateMutex.RLock()
-					role := r.stateManager.GetRole()
-					if role != LEADER {
-						r.stateMutex.RUnlock()
-
+					statusCode := r.processClientCreateRequest(msg.Context, request)
+					if statusCode == external_server.Redirect {
 						clusterState := r.cluster.GetClusterState()
 
 						responseChannel <- external_server.ClusterCreateResponse{
@@ -700,13 +736,8 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 								Address: clusterState.leaderEndpoint,
 							},
 						}
-					}
-					r.stateMutex.RUnlock()
 
-					statusCode := external_server.Ok
-					err := r.processClientCreateRequest(request)
-					if err != nil {
-						statusCode = external_server.Failed
+						break
 					}
 
 					responseChannel <- external_server.ClusterCreateResponse{
@@ -715,11 +746,9 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 				case external_server.ClusterGetRequest:
 					responseChannel := msg.ResponseChannel
 
-					r.stateMutex.RLock()
-					role := r.stateManager.GetRole()
-					if role != LEADER {
-						r.stateMutex.RUnlock()
-
+					// TODO: We might receive stale values
+					value, statusCode := r.processClientGetRequest(request)
+					if statusCode == external_server.Redirect {
 						clusterState := r.cluster.GetClusterState()
 
 						responseChannel <- external_server.ClusterGetResponse{
@@ -728,13 +757,8 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 								Address: clusterState.leaderEndpoint,
 							},
 						}
-					}
-					r.stateMutex.RUnlock()
 
-					statusCode := external_server.Ok
-					value, err := r.processClientGetRequest(request)
-					if err != nil {
-						statusCode = external_server.Failed
+						break
 					}
 
 					responseChannel <- external_server.ClusterGetResponse{
@@ -755,14 +779,223 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 	return finishChannel
 }
 
-func (r *Raft) processClientCreateRequest(request external_server.ClusterCreateRequest) error {
-	// TODO: Implement
-	return nil
+// Sending this request should be always ok, because the majority
+// of servers will reject our request if we are not the leader
+//
+// We try to get the approval of all nodes.
+// For reach failed node or node with false success response,
+// we move the response to a special channel, which will be received
+// by a specific per-node goroutine that shall continue trying to send the
+// message to the node, together with all other failed requests.
+// Meanwhile, all goroutines spawned by this function will have closed
+// by the time of client timeout.
+func (r *Raft) processClientCreateRequest(ctx context.Context, request external_server.ClusterCreateRequest) external_server.ClusterStatusCode {
+	r.stateMutex.Lock()
+
+	// Check if we are still the leader
+	role := r.stateManager.GetRole()
+	if role != LEADER {
+		r.stateMutex.Unlock()
+		r.logger.Errorf("unable to continue with processing client create request - not a leader")
+		return external_server.Redirect
+	}
+
+	// TODO: Maybe check the state machine with the SN of the request ?
+
+	newEntries := []*pb.AppendEntriesRequest_Entry{
+		&pb.AppendEntriesRequest_Entry{
+			Key:     request.Key,
+			Payload: request.Value,
+		},
+	}
+
+	previousLogIndex := r.logManager.GetLastLogIndex()
+	previousLogTerm := r.logManager.GetLastLogTerm()
+
+	// Append client command to log
+	err := r.logManager.AppendLogs(r.stateManager.GetCurrentTerm(), newEntries)
+	if err != nil {
+		r.stateMutex.Unlock()
+		r.logger.Errorf("unable to append logs while processing client create request: %+v", err)
+		return external_server.FailedInternal
+	}
+
+	clusterRequest := &pb.AppendEntriesRequest{
+		Term:         r.stateManager.GetCurrentTerm(),
+		LeaderId:     r.settings.ID,
+		PrevLogIndex: previousLogIndex,
+		PrevLogTerm:  previousLogTerm,
+		LeaderCommit: 0, // TODO
+		Entries:      newEntries,
+	}
+	r.stateMutex.Unlock()
+
+	majorityReachedChannel := make(chan external_server.ClusterStatusCode)
+	go func() {
+		sendMajorityReachedOnce := sync.Once{}
+		sendMajorityReachedResponse := func(count int) {
+			if r.checkClusterMajority(count) {
+				sendMajorityReachedOnce.Do(func() {
+					majorityReachedChannel <- external_server.Ok
+					close(majorityReachedChannel)
+				})
+			}
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		responses := r.cluster.BroadcastAppendEntriesRPCsAsync(ctx, clusterRequest)
+
+		r.stateMutex.RLock()
+		currentTerm := r.stateManager.GetCurrentTerm()
+		r.stateMutex.RUnlock()
+
+		var countOfAcceptedReplies uint32 = 1
+		for responseWrapper := range responses {
+			if responseWrapper.Response.GetTerm() > currentTerm {
+				r.stateMutex.Lock()
+				r.stateManager.SwitchState(responseWrapper.Response.GetTerm(), nil, FOLLOWER)
+				r.stateMutex.Unlock()
+				cancel()
+
+				majorityReachedChannel <- external_server.Redirect
+				close(majorityReachedChannel)
+				return
+			}
+
+			successCallback := func() {
+				atomic.AddUint32(&countOfAcceptedReplies, 1)
+				value := atomic.LoadUint32(&countOfAcceptedReplies)
+				sendMajorityReachedResponse(int(value))
+			}
+
+			if !responseWrapper.Response.GetSuccess() {
+				nodeChannel := r.retryNodeAppendEntriesChannels[responseWrapper.NodeID]
+				nodeChannel <- &retryNodeAppendEntriesRequest{
+					Context:         ctx,
+					OriginalRequest: clusterRequest,
+					SuccessCallback: successCallback,
+				}
+			}
+
+			successCallback()
+		}
+	}()
+
+	majorityReached := external_server.FailedInternal
+	select {
+	case majorityReached = <-majorityReachedChannel:
+	case <-ctx.Done():
+	}
+
+	return majorityReached
 }
 
-func (r *Raft) processClientGetRequest(request external_server.ClusterGetRequest) ([]byte, error) {
-	// TODO: Implement
-	return nil, nil
+func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-chan struct{} {
+	finishChannel := make(chan struct{})
+	go func() {
+		requestChannel, ok := r.retryNodeAppendEntriesChannels[nodeID]
+		if !ok {
+			r.logger.Panicf("no channel for node %s in the map for retrying AppendEntries: %+v", nodeID,
+				r.retryNodeAppendEntriesChannels)
+		}
+
+	processLoop:
+		for {
+		requestLoop:
+			select {
+			case requestWrapper := <-requestChannel:
+				for {
+					select {
+					case <-requestWrapper.Context.Done():
+						break requestLoop
+					default:
+					}
+
+					prevLogIndex := requestWrapper.OriginalRequest.PrevLogIndex - 1
+					if prevLogIndex < startingLogIndex-1 {
+						r.logger.Panicf("node could not accept applying log at index: %+v", prevLogIndex)
+					}
+
+					log, err := r.logManager.FindLogByIndex(prevLogIndex)
+					if err != nil {
+						r.logger.Panicf("unable to find log by index for log: %+v", prevLogIndex)
+					}
+
+					newRequest := &pb.AppendEntriesRequest{
+						Term:         r.stateManager.GetCurrentTerm(),
+						LeaderId:     r.settings.ID,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  log.Term,
+						LeaderCommit: 0, // TODO
+						Entries:      requestWrapper.OriginalRequest.Entries,
+					}
+
+					responseChannel, err := r.cluster.SendAppendEntries(requestWrapper.Context, nodeID, newRequest)
+					if err != nil {
+						// This is a non-gRPC request related error, e.g. nodeID is wrong
+						r.logger.Panicf("unable to call SendAppendEntries due to: %+v", err)
+					}
+
+					response := <-responseChannel
+
+					// Check if the node does not have a higher term
+					// If this happens here, it means that more than a majority of servers
+					// are on a higher term, therefore we can throw away this request
+					r.stateMutex.RLock()
+					currentTerm := r.stateManager.GetCurrentTerm()
+					r.stateMutex.RUnlock()
+
+					if response.GetTerm() > currentTerm {
+						r.stateMutex.Lock()
+						r.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
+						r.stateMutex.Unlock()
+						break requestLoop
+					}
+
+					if response.GetSuccess() {
+						requestWrapper.SuccessCallback()
+					}
+
+					break requestLoop
+				}
+			case <-done:
+				break processLoop
+			}
+		}
+
+		close(finishChannel)
+	}()
+
+	return finishChannel
+}
+
+func (r *Raft) processClientGetRequest(request external_server.ClusterGetRequest) ([]byte, external_server.ClusterStatusCode) {
+	r.stateMutex.Lock()
+	role := r.stateManager.GetRole()
+	if role != LEADER {
+		r.stateMutex.Unlock()
+		return nil, external_server.Redirect
+	}
+	r.stateMutex.Unlock()
+
+	// TODO: The node might not be the leader (but doesn't know it)
+	// so that we might still get stale data
+	result := r.stateMachine.Get(request.Key)
+	if result == nil {
+		return nil, external_server.FailedNotFound
+	}
+
+	return result, external_server.Ok
+}
+
+func (r *Raft) checkClusterMajority(count int) bool {
+	// TODO: maybe save this so that we avoid calling it all the time
+	clusterState := r.cluster.GetClusterState()
+	clusterMajority := int(math.Round(float64(len(clusterState.nodes)) * 0.5))
+	if count > clusterMajority {
+		return true
+	}
+	return false
 }
 
 func newElectionTimeout(min time.Duration, max time.Duration) time.Duration {

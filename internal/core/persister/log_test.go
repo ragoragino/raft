@@ -54,6 +54,26 @@ func TestFileEntryLoggerWithoutRestarts(t *testing.T) {
 		assert.Equal(t, foundLog.Index, uint64(indexOfLogToFind+1))
 	})
 
+	t.Run("Replay", func(t *testing.T) {
+		doneChannel := make(chan struct{})
+		writeChannel := make(chan CommandLog)
+
+		go func() {
+			err := fileEntryLogger.Replay(doneChannel, writeChannel)
+			assert.NoError(t, err)
+
+			close(writeChannel)
+		}()
+
+		i := 0
+		for log := range writeChannel {
+			assert.Equal(t, log.Command, entries[i].Command)
+			i++
+		}
+
+		assert.Equal(t, len(entries), i)
+	})
+
 	t.Run("Delete&Get", func(t *testing.T) {
 		var indexToDeleteLogsAfter uint64 = 3
 		err := fileEntryLogger.DeleteLogsAferIndex(indexToDeleteLogsAfter)
@@ -135,6 +155,26 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 		assert.NotNil(t, lastReceivedLog)
 		assert.Equal(t, &lastReceivedLog.Entry, lastActualEntry)
 		assert.Equal(t, lastReceivedLog.Index, uint64(lastEntryIndex+1))
+	})
+
+	t.Run("Replay", func(t *testing.T) {
+		doneChannel := make(chan struct{})
+		writeChannel := make(chan CommandLog)
+
+		go func() {
+			err := fileEntryLogger.Replay(doneChannel, writeChannel)
+			assert.NoError(t, err)
+
+			close(writeChannel)
+		}()
+
+		i := 0
+		for log := range writeChannel {
+			assert.Equal(t, log.Command, entries[i].Command)
+			i++
+		}
+
+		assert.Equal(t, len(entries)-int(indexToDeleteLogsAfter), i)
 	})
 
 	fileEntryLogger.Close()

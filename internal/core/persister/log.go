@@ -46,9 +46,7 @@ type ILogEntryPersister interface {
 	Close()
 }
 
-// LevelDBLogEntryPersister is safe for concurrent usage,
-// although we currently don't use it from multiple goroutines
-// because AppendEntries RPC are handled sequentially
+// LevelDBLogEntryPersister is safe for concurrent usage
 type LevelDBLogEntryPersister struct {
 	// leveldb.DB is safe for concurrent usage
 	db                 *leveldb.DB
@@ -259,17 +257,22 @@ func (l *LevelDBLogEntryPersister) Replay(doneChannel <-chan struct{}, writeChan
 	firstIndexBuffer := make([]byte, 8)
 	binary.LittleEndian.PutUint64(firstIndexBuffer, firstIndex)
 
+	// End must be adjusted by one due to open range iteration, e.g. [0, 10)
 	lastIndexBuffer := make([]byte, 8)
-	binary.LittleEndian.PutUint64(lastIndexBuffer, lastIndex)
+	binary.LittleEndian.PutUint64(lastIndexBuffer, lastIndex+1)
 
 	iter := l.db.NewIterator(&util.Range{Start: firstIndexBuffer, Limit: lastIndexBuffer}, nil)
+processLoop:
 	for {
 		select {
 		case <-doneChannel:
 			iter.Release()
 			return nil
 		default:
-			iter.Next()
+			if !iter.Next() {
+				break processLoop
+			}
+
 			value := iter.Value()
 			commandLogUnmarshalled := CommandLog{}
 			err := json.Unmarshal(value, &commandLogUnmarshalled)
