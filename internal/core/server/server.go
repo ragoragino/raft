@@ -35,12 +35,14 @@ const (
 	Redirect       ClusterStatusCode = iota
 )
 
-type ClusterMessage struct {
-	Error   error
-	Address string
-}
-
 type ClusterRequest interface{}
+
+type ClusterResponse interface{}
+
+type ClusterMessage struct {
+	Error      error
+	LeaderName string
+}
 
 type ClusterCreateRequest struct {
 	Key   string
@@ -51,13 +53,13 @@ type ClusterGetRequest struct {
 	Key string
 }
 
+// Request / Response must be either ClusterCreateRequest / ClusterCreateResponse
+// or ClustereGetRequest / ClusterGetResponse
 type ClusterRequestWrapper struct {
 	Context         context.Context
 	Request         ClusterRequest
 	ResponseChannel chan<- ClusterResponse
 }
-
-type ClusterResponse interface{}
 
 type ClusterCreateResponse struct {
 	StatusCode ClusterStatusCode
@@ -70,7 +72,7 @@ type ClusterGetResponse struct {
 	Value      []byte
 }
 
-type IExternalServer interface {
+type Interface interface {
 	Run() error
 	Shutdown(ctx context.Context) error
 	GetRequestChannel() (<-chan ClusterRequestWrapper, error)
@@ -81,16 +83,18 @@ type ExternalServer struct {
 	router                *mux.Router
 	requestProcessChannel chan ClusterRequestWrapper
 	logger                *logrus.Entry
+	nodesEndpoints        map[string]string
 }
 
-func New(endpoint string, logger *logrus.Entry) *ExternalServer {
+func New(endpoint string, nodesEndpoints map[string]string, logger *logrus.Entry) *ExternalServer {
 	externalServer := &ExternalServer{
-		logger: logger,
+		logger:         logger,
+		nodesEndpoints: nodesEndpoints,
 	}
 
 	r := mux.NewRouter()
 	r.HandleFunc("/create", externalServer.handleCreate).Methods("POST")
-	r.HandleFunc("/get", externalServer.handleGet).Methods("GET")
+	r.HandleFunc("/get", externalServer.handleGet).Methods("POST")
 
 	s := &http.Server{
 		Handler:      r,
@@ -162,7 +166,16 @@ func (s *ExternalServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		case Redirect:
-			http.Redirect(w, r, responseTyped.Message.Address, http.StatusFound)
+			leaderAddress, ok := s.nodesEndpoints[responseTyped.Message.LeaderName]
+			if !ok {
+				s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
+					responseTyped.Message.LeaderName, s.nodesEndpoints)
+			}
+
+			// Return StatusTemporaryRedirect, as only 307 and 308 statuses
+			// force http clients to follow redirects with the same methods
+			endpoint := "http://" + leaderAddress + "/create"
+			http.Redirect(w, r, endpoint, http.StatusTemporaryRedirect)
 			return
 		}
 	default:
@@ -213,7 +226,16 @@ func (s *ExternalServer) handleGet(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		case Redirect:
-			http.Redirect(w, r, responseTyped.Message.Address, http.StatusFound)
+			leaderAddress, ok := s.nodesEndpoints[responseTyped.Message.LeaderName]
+			if !ok {
+				s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
+					responseTyped.Message.LeaderName, s.nodesEndpoints)
+			}
+
+			// Return StatusTemporaryRedirect, as only 307 and 308 statuses
+			// force http clients to follow redirects with the same methods
+			endpoint := "http://" + leaderAddress + "/get"
+			http.Redirect(w, r, endpoint, http.StatusTemporaryRedirect)
 			return
 		}
 	default:

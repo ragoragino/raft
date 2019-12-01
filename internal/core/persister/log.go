@@ -24,6 +24,8 @@ const (
 
 var (
 	ErrIndexedLogDoesNotExists = errors.New("Log with given index does not exist.")
+
+	ErrDatabaseEmpty = errors.New("Database is empty")
 )
 
 type CommandLog struct {
@@ -193,7 +195,7 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	defer l.lastCommandLogLock.Unlock()
 
 	if l.lastCommandLog == nil {
-		return ErrIndexedLogDoesNotExists
+		return ErrDatabaseEmpty
 	}
 
 	lastIndex := l.lastCommandLog.Index
@@ -225,12 +227,17 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 		batch.Delete(indexBuffer)
 	}
 
-	binary.LittleEndian.PutUint64(indexBuffer, lastCommandLog.Index)
-
 	lastLogDbKeyBuffer := make([]byte, 8)
 	binary.LittleEndian.PutUint64(lastLogDbKeyBuffer, lastLogDbKey)
 
-	batch.Put(lastLogDbKeyBuffer, indexBuffer)
+	// Check if we did not delete all the documents
+	// If so, delete also the lastLogDbKey key
+	if lastCommandLog == nil {
+		batch.Delete(lastLogDbKeyBuffer)
+	} else {
+		binary.LittleEndian.PutUint64(indexBuffer, lastCommandLog.Index)
+		batch.Put(lastLogDbKeyBuffer, indexBuffer)
+	}
 
 	err := l.db.Write(batch, nil)
 	if err != nil {

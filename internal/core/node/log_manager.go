@@ -28,7 +28,7 @@ func NewLogEntryManager(entryPersister persister.ILogEntryPersister) *LogEntryMa
 func (l *LogEntryManager) GetLastLogIndex() uint64 {
 	log := l.entryPersister.GetLastLog()
 	if log == nil {
-		return startingLogIndex
+		return startingLogIndex - 1
 	}
 
 	return log.Index

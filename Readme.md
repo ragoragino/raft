@@ -1,6 +1,6 @@
-24.11.2019:
-- Veirfy processing client requests in Raft struct and start creating tests
+1.12.2019:
+- Implement log repair while doing server heartbeat
+- Add test to test client requests under network failures
 - Add serial number to client request
-- Update node_test.go for state machine and external server
-- TODO: implement HTTP client and finish HTTP server methods as DELETE, UPDATE
+- Finish HTTP server methods as DELETE, UPDATE (+ allow parallel GET)
 - http://cricca.disi.unitn.it/montresor/teaching/ds2/slides/

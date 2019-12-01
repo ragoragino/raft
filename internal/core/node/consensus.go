@@ -144,16 +144,15 @@ type Raft struct {
 
 func NewRaft(cluster ICluster, logger *logrus.Entry, stateManager IStateManager,
 	logManager ILogEntryManager, stateMachine IStateMachine, clusterServer IClusterServer,
-	externelServer external_server.IExternalServer, opts ...RaftCallOption) *Raft {
-
+	externelServer external_server.Interface, opts ...RaftCallOption) *Raft {
 	appendEntriesProcessChannel, err := clusterServer.GetAppendEntriesChannel()
 	if err != nil {
-		logger.Panicf("unable to obtain cluster server channel: %+v", err)
+		logger.Panicf("unable to obtain cluster server AppendEntries channel: %+v", err)
 	}
 
 	requestVoteProcessChannel, err := clusterServer.GetRequestVoteChannel()
 	if err != nil {
-		logger.Panicf("unable to obtain cluster server channel: %+v", err)
+		logger.Panicf("unable to obtain cluster server RequestVote channel: %+v", err)
 	}
 
 	clientRequestChannel, err := externelServer.GetRequestChannel()
@@ -190,12 +189,10 @@ func (r *Raft) Run() {
 
 	clusterState := r.cluster.GetClusterState()
 	endRetryNodeAppendEntriesChannel := make(map[string]<-chan struct{}, len(clusterState.nodes))
-	retryNodeAppendEntriesChannels := make(map[string]chan *retryNodeAppendEntriesRequest, len(clusterState.nodes))
+	r.retryNodeAppendEntriesChannels = make(map[string]chan *retryNodeAppendEntriesRequest, len(clusterState.nodes))
 	for _, node := range clusterState.nodes {
-		retryNodeAppendEntriesChannels[node] = make(chan *retryNodeAppendEntriesRequest, r.settings.AppendEntryRetryBufferSize)
+		r.retryNodeAppendEntriesChannels[node] = make(chan *retryNodeAppendEntriesRequest, r.settings.AppendEntryRetryBufferSize)
 	}
-
-	r.retryNodeAppendEntriesChannels = retryNodeAppendEntriesChannels
 
 	for _, node := range clusterState.nodes {
 		endRetryNodeAppendEntriesChannel[node] = r.retryNodeAppendEntries(r.closeChannel, node)
@@ -208,9 +205,11 @@ func (r *Raft) Run() {
 	ctx, cancel := context.WithCancel(context.Background())
 	doneChannel := r.HandleRoleFollower(ctx, stateChangedChannel)
 
+	// This is the main Raft running loop
+	var newRole RaftRole
 	for {
-		// Waiting for the definitive end of the previous state
-		var newRole RaftRole
+
+		// Wait for the end of the previous state, or close signal from the user
 		select {
 		case newRole = <-doneChannel:
 			cancel()
@@ -222,7 +221,7 @@ func (r *Raft) Run() {
 			<-clientEndChannel
 			for nodeID, channel := range endRetryNodeAppendEntriesChannel {
 				<-channel
-				close(retryNodeAppendEntriesChannels[nodeID])
+				close(r.retryNodeAppendEntriesChannels[nodeID])
 			}
 			close(r.runFinishedChannel)
 			return
@@ -258,6 +257,7 @@ func (r *Raft) HandleRoleFollower(ctx context.Context, stateChangedChannel <-cha
 	go func() {
 		electionTimeout := newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
 		electionTimedChannel := make(chan struct{})
+		defer close(electionTimedChannel)
 
 		// We will switch state in this goroutine after the follower times out
 		// and wait for the invoked event to come in order to return from the handler
@@ -297,7 +297,7 @@ func (r *Raft) HandleRoleFollower(ctx context.Context, stateChangedChannel <-cha
 					electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
 				}
 			case <-time.After(electionTimeout):
-				close(electionTimedChannel)
+				electionTimedChannel <- struct{}{}
 			case <-ctx.Done():
 				break outerloop
 			}
@@ -470,12 +470,16 @@ func (r *Raft) HandleRoleLeader(ctx context.Context, stateChangedChannel <-chan 
 	return doneChannel
 }
 
+// TODO: Add log repairing for failed nodes in heartbeat sending
 func (r *Raft) broadcastHeartbeat(ctx context.Context) {
 	r.stateMutex.RLock()
 	request := &pb.AppendEntriesRequest{
-		Term:     r.stateManager.GetCurrentTerm(),
-		LeaderId: r.settings.ID,
-		Entries:  make([]*pb.AppendEntriesRequest_Entry, 0),
+		Term:         r.stateManager.GetCurrentTerm(),
+		LeaderId:     r.settings.ID,
+		PrevLogIndex: r.logManager.GetLastLogIndex(),
+		PrevLogTerm:  r.logManager.GetLastLogTerm(),
+		LeaderCommit: 0, // TODO
+		Entries:      make([]*pb.AppendEntriesRequest_Entry, 0),
 	}
 	r.stateMutex.RUnlock()
 
@@ -526,6 +530,9 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 
 				senderTerm := request.GetTerm()
 				receiverTerm := r.stateManager.GetCurrentTerm()
+				entries := request.GetEntries()
+				previousLogIndex := request.GetPrevLogIndex()
+				leaderID := request.GetLeaderId()
 
 				responseFunc := func(sentByLeader bool, entriesAppended bool) {
 					r.appendEntriesHandlersChannel <- appendEntriesEvent{
@@ -542,9 +549,9 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				}
 
 				if senderTerm > receiverTerm {
-					// The node has higher term than the node, so we switch to FOLLOWER
+					// The sender node has higher term than the receiver node, so we switch to FOLLOWER
 					logger.Debugf("switching state to follower. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
-					r.stateManager.SwitchState(request.GetTerm(), nil, FOLLOWER)
+					r.stateManager.SwitchState(senderTerm, nil, FOLLOWER)
 				} else if senderTerm < receiverTerm {
 					// The candidate has lower term than the node, so deny the request
 					logger.Debugf("sending reject response. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
@@ -553,39 +560,52 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 					continue
 				} else if r.stateManager.GetRole() == CANDIDATE {
 					logger.Debugf("switching state to follower because received request with an equal term from a leader")
-					r.stateManager.SwitchState(request.GetTerm(), nil, FOLLOWER)
+					r.stateManager.SwitchState(senderTerm, nil, FOLLOWER)
 				}
 
 				// Set the leader
-				err := r.cluster.SetLeader(request.GetLeaderId())
+				err := r.cluster.SetLeader(leaderID)
 				if err != nil {
-					logger.Errorf("unable to set leader: %+v", err)
+					logger.Panicf("unable to set leader %s: %+v", leaderID, err)
 				}
 
-				index := request.GetPrevLogIndex()
-				if index >= startingLogIndex-1 {
-					log, err := r.logManager.FindLogByIndex(index)
+				// We check if the index is correct
+				// index == startingLogIndex - 1 signifies we received first log
+				if previousLogIndex < startingLogIndex-1 {
+					logger.Panicf("received request with a previous index %d lower than the lower limit for log indexes",
+						previousLogIndex)
+				} else if previousLogIndex >= startingLogIndex {
+					log, err := r.logManager.FindLogByIndex(previousLogIndex)
 					if err == persister.ErrIndexedLogDoesNotExists {
 						r.stateMutex.Unlock()
+						logger.Debugf("unable to find log with index: %+v", previousLogIndex)
 						responseFunc(true, false)
 						continue
 					} else if err != nil {
 						r.stateMutex.Unlock()
-						logger.Panicf("unable to find log by index %d: %+v", index, err)
+						logger.Panicf("failed when finding log by index %d: %+v", previousLogIndex, err)
 					}
 
 					if log.Term != request.GetPrevLogTerm() {
-						err := r.logManager.DeleteLogsAferIndex(index)
+						err := r.logManager.DeleteLogsAferIndex(previousLogIndex)
 						if err != nil {
 							r.stateMutex.Unlock()
-							logger.Panicf("unable to delete log after index %d: %+v", index, err)
+							logger.Panicf("unable to delete log after index %d: %+v", previousLogIndex, err)
 						}
+					}
+				} else if len(entries) != 0 {
+					// This is the case when we received first log to append
+					// Therefore we need to delete all logs
+					err := r.logManager.DeleteLogsAferIndex(startingLogIndex)
+					if err != nil && err != persister.ErrDatabaseEmpty {
+						r.stateMutex.Unlock()
+						logger.Panicf("unable to delete log after index %d: %+v", previousLogIndex, err)
 					}
 				}
 
-				entries := request.GetEntries()
 				if len(entries) != 0 {
-					err := r.logManager.AppendLogs(r.stateManager.GetCurrentTerm(), entries)
+					logger.Debugf("appending entries")
+					err := r.logManager.AppendLogs(senderTerm, entries)
 					if err != nil {
 						r.stateMutex.Unlock()
 						logger.Panicf("unable to append logs: %+v", err)
@@ -723,7 +743,7 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 			select {
 			case msg := <-r.clientRequestChannel:
 				switch request := msg.Request.(type) {
-				case external_server.ClusterCreateRequest:
+				case *external_server.ClusterCreateRequest:
 					responseChannel := msg.ResponseChannel
 
 					statusCode := r.processClientCreateRequest(msg.Context, request)
@@ -733,7 +753,7 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 						responseChannel <- external_server.ClusterCreateResponse{
 							StatusCode: external_server.Redirect,
 							Message: external_server.ClusterMessage{
-								Address: clusterState.leaderEndpoint,
+								LeaderName: clusterState.leaderName,
 							},
 						}
 
@@ -743,10 +763,9 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 					responseChannel <- external_server.ClusterCreateResponse{
 						StatusCode: statusCode,
 					}
-				case external_server.ClusterGetRequest:
+				case *external_server.ClusterGetRequest:
 					responseChannel := msg.ResponseChannel
 
-					// TODO: We might receive stale values
 					value, statusCode := r.processClientGetRequest(request)
 					if statusCode == external_server.Redirect {
 						clusterState := r.cluster.GetClusterState()
@@ -754,7 +773,7 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 						responseChannel <- external_server.ClusterGetResponse{
 							StatusCode: external_server.Redirect,
 							Message: external_server.ClusterMessage{
-								Address: clusterState.leaderEndpoint,
+								LeaderName: clusterState.leaderName,
 							},
 						}
 
@@ -783,24 +802,32 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 // of servers will reject our request if we are not the leader
 //
 // We try to get the approval of all nodes.
-// For reach failed node or node with false success response,
+// For each failed node or node with false success response,
 // we move the response to a special channel, which will be received
 // by a specific per-node goroutine that shall continue trying to send the
-// message to the node, together with all other failed requests.
+// message to the node, together with all other failed requests to that node.
 // Meanwhile, all goroutines spawned by this function will have closed
 // by the time of client timeout.
-func (r *Raft) processClientCreateRequest(ctx context.Context, request external_server.ClusterCreateRequest) external_server.ClusterStatusCode {
-	r.stateMutex.Lock()
+func (r *Raft) processClientCreateRequest(ctx context.Context, request *external_server.ClusterCreateRequest) external_server.ClusterStatusCode {
+	r.logger.Printf("received client create request: %+v", request)
+
+	r.stateMutex.RLock()
 
 	// Check if we are still the leader
 	role := r.stateManager.GetRole()
 	if role != LEADER {
-		r.stateMutex.Unlock()
+		r.stateMutex.RUnlock()
 		r.logger.Errorf("unable to continue with processing client create request - not a leader")
 		return external_server.Redirect
 	}
 
 	// TODO: Maybe check the state machine with the SN of the request ?
+
+	previousLogIndex := r.logManager.GetLastLogIndex()
+	previousLogTerm := r.logManager.GetLastLogTerm()
+	currentTerm := r.stateManager.GetCurrentTerm()
+
+	r.stateMutex.RUnlock()
 
 	newEntries := []*pb.AppendEntriesRequest_Entry{
 		&pb.AppendEntriesRequest_Entry{
@@ -809,48 +836,56 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request external_
 		},
 	}
 
-	previousLogIndex := r.logManager.GetLastLogIndex()
-	previousLogTerm := r.logManager.GetLastLogTerm()
-
 	// Append client command to log
-	err := r.logManager.AppendLogs(r.stateManager.GetCurrentTerm(), newEntries)
+	err := r.logManager.AppendLogs(currentTerm, newEntries)
 	if err != nil {
-		r.stateMutex.Unlock()
 		r.logger.Errorf("unable to append logs while processing client create request: %+v", err)
 		return external_server.FailedInternal
 	}
 
 	clusterRequest := &pb.AppendEntriesRequest{
-		Term:         r.stateManager.GetCurrentTerm(),
+		Term:         currentTerm,
 		LeaderId:     r.settings.ID,
 		PrevLogIndex: previousLogIndex,
 		PrevLogTerm:  previousLogTerm,
 		LeaderCommit: 0, // TODO
 		Entries:      newEntries,
 	}
-	r.stateMutex.Unlock()
 
 	majorityReachedChannel := make(chan external_server.ClusterStatusCode)
 	go func() {
+		defer close(majorityReachedChannel)
+
 		sendMajorityReachedOnce := sync.Once{}
 		sendMajorityReachedResponse := func(count int) {
 			if r.checkClusterMajority(count) {
 				sendMajorityReachedOnce.Do(func() {
-					majorityReachedChannel <- external_server.Ok
-					close(majorityReachedChannel)
+					// Use default in select, because it might happen that there won't be any receivers
+					// as the processing routine might have finished due to client timeout
+					select {
+					case majorityReachedChannel <- external_server.Ok:
+					default:
+					}
+
+					// Update the key in the state machine
+					r.stateMachine.Create(request.Key, request.Value)
 				})
 			}
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		responses := r.cluster.BroadcastAppendEntriesRPCsAsync(ctx, clusterRequest)
+		r.logger.Printf("sending AppendEntries request: %+v", clusterRequest)
 
-		r.stateMutex.RLock()
-		currentTerm := r.stateManager.GetCurrentTerm()
-		r.stateMutex.RUnlock()
+		requestCtx, cancel := context.WithCancel(context.Background())
+		responses := r.cluster.BroadcastAppendEntriesRPCsAsync(requestCtx, clusterRequest)
 
 		var countOfAcceptedReplies uint32 = 1
 		for responseWrapper := range responses {
+			r.logger.Printf("received AppendEntries response: %+v", responseWrapper)
+
+			// This situation could happen under following conditions:
+			// We start replication -> receive majority -> network partition occurs.
+			// We are not the leader anymore and all servers that did not replicate
+			// our AppendEntries will have higher term
 			if responseWrapper.Response.GetTerm() > currentTerm {
 				r.stateMutex.Lock()
 				r.stateManager.SwitchState(responseWrapper.Response.GetTerm(), nil, FOLLOWER)
@@ -858,7 +893,6 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request external_
 				cancel()
 
 				majorityReachedChannel <- external_server.Redirect
-				close(majorityReachedChannel)
 				return
 			}
 
@@ -871,23 +905,25 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request external_
 			if !responseWrapper.Response.GetSuccess() {
 				nodeChannel := r.retryNodeAppendEntriesChannels[responseWrapper.NodeID]
 				nodeChannel <- &retryNodeAppendEntriesRequest{
-					Context:         ctx,
+					Context:         requestCtx,
 					OriginalRequest: clusterRequest,
 					SuccessCallback: successCallback,
 				}
+
+				continue
 			}
 
 			successCallback()
 		}
 	}()
 
-	majorityReached := external_server.FailedInternal
+	majorityReachedStatus := external_server.FailedInternal
 	select {
-	case majorityReached = <-majorityReachedChannel:
+	case majorityReachedStatus = <-majorityReachedChannel:
 	case <-ctx.Done():
 	}
 
-	return majorityReached
+	return majorityReachedStatus
 }
 
 func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-chan struct{} {
@@ -916,20 +952,34 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 						r.logger.Panicf("node could not accept applying log at index: %+v", prevLogIndex)
 					}
 
-					log, err := r.logManager.FindLogByIndex(prevLogIndex)
-					if err != nil {
-						r.logger.Panicf("unable to find log by index for log: %+v", prevLogIndex)
+					var term uint64
+					if prevLogIndex == startingLogIndex-1 {
+						term = startingTerm
+					} else {
+						log, err := r.logManager.FindLogByIndex(prevLogIndex)
+						if err != nil {
+							r.logger.Panicf("unable to find log for index %d: %+v", prevLogIndex, err)
+						}
+
+						term = log.Term
 					}
 
+					r.stateMutex.RLock()
+					currentTerm := r.stateManager.GetCurrentTerm()
+					r.stateMutex.RUnlock()
+
 					newRequest := &pb.AppendEntriesRequest{
-						Term:         r.stateManager.GetCurrentTerm(),
+						Term:         currentTerm,
 						LeaderId:     r.settings.ID,
 						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  log.Term,
+						PrevLogTerm:  term,
 						LeaderCommit: 0, // TODO
 						Entries:      requestWrapper.OriginalRequest.Entries,
 					}
 
+					r.logger.Printf("retrying AppendEntries request: %+v", newRequest)
+
+					// SendAppendEntries will continue retrying until it receives a response
 					responseChannel, err := r.cluster.SendAppendEntries(requestWrapper.Context, nodeID, newRequest)
 					if err != nil {
 						// This is a non-gRPC request related error, e.g. nodeID is wrong
@@ -938,13 +988,11 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 
 					response := <-responseChannel
 
+					r.logger.Printf("received AppendEntries retry response: %+v", response)
+
 					// Check if the node does not have a higher term
 					// If this happens here, it means that more than a majority of servers
 					// are on a higher term, therefore we can throw away this request
-					r.stateMutex.RLock()
-					currentTerm := r.stateManager.GetCurrentTerm()
-					r.stateMutex.RUnlock()
-
 					if response.GetTerm() > currentTerm {
 						r.stateMutex.Lock()
 						r.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
@@ -969,14 +1017,16 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 	return finishChannel
 }
 
-func (r *Raft) processClientGetRequest(request external_server.ClusterGetRequest) ([]byte, external_server.ClusterStatusCode) {
-	r.stateMutex.Lock()
+func (r *Raft) processClientGetRequest(request *external_server.ClusterGetRequest) ([]byte, external_server.ClusterStatusCode) {
+	r.logger.Printf("received client get request: %+v", request)
+
+	r.stateMutex.RLock()
 	role := r.stateManager.GetRole()
 	if role != LEADER {
-		r.stateMutex.Unlock()
+		r.stateMutex.RUnlock()
 		return nil, external_server.Redirect
 	}
-	r.stateMutex.Unlock()
+	r.stateMutex.RUnlock()
 
 	// TODO: The node might not be the leader (but doesn't know it)
 	// so that we might still get stale data

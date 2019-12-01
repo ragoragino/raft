@@ -186,6 +186,7 @@ func (c *Cluster) SetLeader(leaderName string) error {
 func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request *pb.AppendEntriesRequest) (<-chan *pb.AppendEntriesResponse, error) {
 	var destinationNode *NodeInfo
 
+	// TODO: Does it make sense to optimize this to map?
 	for _, node := range c.nodes {
 		if node.name == nodeID {
 			destinationNode = node

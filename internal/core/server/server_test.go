@@ -20,9 +20,8 @@ func TestHandlersCreate(t *testing.T) {
 		TimestampFormat: time.RFC3339Nano,
 	})
 
-	server := New("localhost:80", logger.WithFields(logrus.Fields{
-		"component": "server",
-	}))
+	server := New("localhost:80", map[string]string{"Node0": "127.0.0.1:8001"},
+		logger.WithFields(logrus.Fields{"component": "server"}))
 	ch, err := server.GetRequestChannel()
 	assert.NoError(t, err)
 
@@ -59,14 +58,14 @@ func TestHandlersCreate(t *testing.T) {
 			clusterResponse: ClusterCreateResponse{
 				StatusCode: Redirect,
 				Message: ClusterMessage{
-					Address: "127.0.0.1",
+					LeaderName: "Node0",
 				},
 			},
 			expectedClusterRequest: &ClusterCreateRequest{
 				Key:   "key",
 				Value: []byte("value"),
 			},
-			expectedStatusCode: http.StatusFound,
+			expectedStatusCode: http.StatusTemporaryRedirect,
 		},
 		{
 			name: "failed",
@@ -117,9 +116,8 @@ func TestHandlersGet(t *testing.T) {
 		TimestampFormat: time.RFC3339Nano,
 	})
 
-	server := New("localhost:80", logger.WithFields(logrus.Fields{
-		"component": "server",
-	}))
+	server := New("localhost:80", map[string]string{"Node0": "127.0.0.1:8001"},
+		logger.WithFields(logrus.Fields{"component": "server"}))
 	ch, err := server.GetRequestChannel()
 	assert.NoError(t, err)
 
@@ -154,13 +152,13 @@ func TestHandlersGet(t *testing.T) {
 			clusterResponse: ClusterGetResponse{
 				StatusCode: Redirect,
 				Message: ClusterMessage{
-					Address: "127.0.0.1",
+					LeaderName: "Node0",
 				},
 			},
 			expectedClusterRequest: &ClusterGetRequest{
 				Key: "key",
 			},
-			expectedStatusCode: http.StatusFound,
+			expectedStatusCode: http.StatusTemporaryRedirect,
 		},
 		{
 			name: "failed",
