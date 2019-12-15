@@ -110,6 +110,12 @@ func New(endpoint string, nodesEndpoints map[string]string, logger *logrus.Entry
 }
 
 func (s *ExternalServer) Shutdown(ctx context.Context) error {
+	defer func() {
+		if s.requestProcessChannel != nil {
+			close(s.requestProcessChannel)
+		}
+	}()
+
 	if err := s.server.Shutdown(ctx); err != nil {
 		return err
 	}

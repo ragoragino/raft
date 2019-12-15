@@ -9,7 +9,7 @@ import (
 
 type IStateMachine interface {
 	Create(key string, value []byte)
-	Get(key string) []byte
+	Get(key string) ([]byte, bool)
 	Delete(key string)
 	LoadState(writeChannel <-chan persister.CommandLog) error
 }
@@ -33,10 +33,11 @@ func (sm *StateMachine) Create(key string, value []byte) {
 	sm.stateMutex.Unlock()
 }
 
-func (sm *StateMachine) Get(key string) []byte {
+func (sm *StateMachine) Get(key string) ([]byte, bool) {
 	sm.stateMutex.RLock()
 	defer sm.stateMutex.RUnlock()
-	return sm.state[key]
+	value, ok := sm.state[key]
+	return value, ok
 }
 
 func (sm *StateMachine) Delete(key string) {

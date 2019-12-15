@@ -3,12 +3,13 @@ package node
 import (
 	"context"
 	"fmt"
-	logrus "github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
 	"net"
 	"net/http"
 	pb "raft/internal/core/node/gen"
 	"sync"
+
+	logrus "github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 )
 
 type serverOptions struct {
@@ -87,32 +88,31 @@ func NewClusterServer(logger *logrus.Entry, opts ...ServerCallOption) *ClusterSe
 	return clusterServer
 }
 
-func (s *ClusterServer) Run() {
-	go func() {
-		lis, err := net.Listen("tcp", s.settings.Endpoint)
-		if err != nil {
-			s.logger.Panicf("failed to listen: %+v", err)
-		}
+func (s *ClusterServer) Run() error {
+	lis, err := net.Listen("tcp", s.settings.Endpoint)
+	if err != nil {
+		return err
+	}
 
-		if err := s.grpcServer.Serve(lis); err != nil && err != http.ErrServerClosed {
-			s.logger.Panicf("failed to serve: %v", err)
-		}
-		close(s.runFinishedChannel)
-	}()
+	if err := s.grpcServer.Serve(lis); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+
+	return nil
 }
 
 // Should be closed only once
 func (s *ClusterServer) Close() {
-	s.logger.Debugf("closing server")
+	s.logger.Debugf("closing cluster server")
 
 	s.grpcServer.GracefulStop()
-
-	<-s.runFinishedChannel
 
 	// Closing process channels should be safe because we have
 	// already closed the server (i.e. no more RPCs)
 	close(s.appendEntriesProcessChannel)
 	close(s.requestVoteProcessChannel)
+
+	s.logger.Debugf("cluster server closed")
 }
 
 func (s *ClusterServer) GetAppendEntriesChannel() (<-chan appendEntriesProcessRequest, error) {
