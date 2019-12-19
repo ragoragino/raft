@@ -4,7 +4,7 @@ package node
 
 import (
 	"context"
-	logrus "github.com/sirupsen/logrus"
+	// "github.com/sasha-s/go-deadlock"
 	"math"
 	"math/rand"
 	pb "raft/internal/core/node/gen"
@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	logrus "github.com/sirupsen/logrus"
 )
 
 type raftOptions struct {
@@ -115,9 +117,9 @@ type requestVoteEvent struct {
 }
 
 type retryNodeAppendEntriesRequest struct {
-	Context         context.Context
 	OriginalRequest *pb.AppendEntriesRequest
 	SuccessCallback func()
+	FromError       error
 }
 
 type Raft struct {
@@ -140,10 +142,11 @@ type Raft struct {
 	clientRequestChannel <-chan external_server.ClusterRequestWrapper
 
 	retryNodeAppendEntriesChannels map[string]chan *retryNodeAppendEntriesRequest
+	retryNodeHeartbeatChannels     map[string]chan *retryNodeAppendEntriesRequest
 }
 
-func NewRaft(cluster ICluster, logger *logrus.Entry, stateManager IStateManager,
-	logManager ILogEntryManager, stateMachine IStateMachine, clusterServer IClusterServer,
+func NewRaft(logger *logrus.Entry, stateManager IStateManager, logManager ILogEntryManager,
+	stateMachine IStateMachine, cluster ICluster, clusterServer IClusterServer,
 	externelServer external_server.Interface, opts ...RaftCallOption) *Raft {
 	appendEntriesProcessChannel, err := clusterServer.GetAppendEntriesChannel()
 	if err != nil {
@@ -180,18 +183,13 @@ func NewRaft(cluster ICluster, logger *logrus.Entry, stateManager IStateManager,
 }
 
 func (r *Raft) Run() {
-	stateChangedChannel := make(chan StateSwitched)
-	id := r.stateManager.AddStateObserver(stateChangedChannel)
-	defer func() {
-		r.stateManager.RemoveStateObserver(id)
-		close(stateChangedChannel)
-	}()
-
 	clusterState := r.cluster.GetClusterState()
 	endRetryNodeAppendEntriesChannel := make(map[string]<-chan struct{}, len(clusterState.nodes))
 	r.retryNodeAppendEntriesChannels = make(map[string]chan *retryNodeAppendEntriesRequest, len(clusterState.nodes))
+	r.retryNodeHeartbeatChannels = make(map[string]chan *retryNodeAppendEntriesRequest, len(clusterState.nodes))
 	for _, node := range clusterState.nodes {
 		r.retryNodeAppendEntriesChannels[node] = make(chan *retryNodeAppendEntriesRequest, r.settings.AppendEntryRetryBufferSize)
+		r.retryNodeHeartbeatChannels[node] = make(chan *retryNodeAppendEntriesRequest, 1)
 	}
 
 	for _, node := range clusterState.nodes {
@@ -203,44 +201,101 @@ func (r *Raft) Run() {
 	clientEndChannel := r.processClientRequests(r.closeChannel)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	doneChannel := r.HandleRoleFollower(ctx, stateChangedChannel)
+	doneChannel := r.HandleRoleFollower(ctx)
 
 	// This is the main Raft running loop
-	var newRole RaftRole
+	currentRole := FOLLOWER
+	roleChangedChannel, roleObserverEndChannel := r.observeStateChanges(r.closeChannel, currentRole)
+
+handlerLoop:
 	for {
 
 		// Wait for the end of the previous state, or close signal from the user
-		select {
-		case newRole = <-doneChannel:
-			cancel()
-		case <-r.closeChannel:
-			cancel()
-			<-doneChannel
-			<-appendEntriesProcessingEndChannel
-			<-requestVoteProcessingEndChannel
-			<-clientEndChannel
-			for nodeID, channel := range endRetryNodeAppendEntriesChannel {
-				<-channel
-				close(r.retryNodeAppendEntriesChannels[nodeID])
+	stateLoop:
+		for {
+			select {
+			case <-doneChannel:
+				r.logger.Panicf("unexpectedly received closed doneChannel")
+			case <-r.closeChannel:
+				cancel()
+				<-doneChannel
+				break handlerLoop
+			case currentRole = <-roleChangedChannel:
+				cancel()
+				<-doneChannel
+				break stateLoop
 			}
-			close(r.runFinishedChannel)
-			return
 		}
 
-		r.logger.Debugf("handler for old role finished. New role: %+v", newRole)
+		r.logger.Debugf("handler for old role finished. New role: %+v", currentRole)
 
 		ctx, cancel = context.WithCancel(context.Background())
-		switch newRole {
+		switch currentRole {
 		case FOLLOWER:
-			doneChannel = r.HandleRoleFollower(ctx, stateChangedChannel)
+			doneChannel = r.HandleRoleFollower(ctx)
 		case CANDIDATE:
-			doneChannel = r.HandleRoleCandidate(ctx, stateChangedChannel)
+			doneChannel = r.HandleRoleCandidate(ctx)
 		case LEADER:
-			doneChannel = r.HandleRoleLeader(ctx, stateChangedChannel)
+			doneChannel = r.HandleRoleLeader(ctx)
 		default:
-			r.logger.Panicf("unrecognized role: %+v", newRole)
+			r.logger.Panicf("unrecognized role: %+v", currentRole)
 		}
 	}
+
+	// Wait for the end of the state observer
+	<-roleObserverEndChannel
+
+	// Wait for the end of processing AppendEntries
+	<-appendEntriesProcessingEndChannel
+	close(r.appendEntriesHandlersChannel)
+
+	// Wait for the end of processing RequestVote
+	<-requestVoteProcessingEndChannel
+	close(r.requestVoteHandlersChannel)
+
+	// Wait for the end of client processing
+	<-clientEndChannel
+
+	// Wait for the end of per-node retry goroutines
+	for nodeID, channel := range endRetryNodeAppendEntriesChannel {
+		<-channel
+		close(r.retryNodeAppendEntriesChannels[nodeID])
+		close(r.retryNodeHeartbeatChannels[nodeID])
+	}
+
+	// Signal end of the Raft engine closing
+	close(r.runFinishedChannel)
+}
+
+func (r *Raft) observeStateChanges(doneChannel <-chan struct{}, currentRole RaftRole) (<-chan RaftRole, <-chan struct{}) {
+	finishChannel := make(chan struct{})
+	roleChangedChannel := make(chan RaftRole)
+
+	stateChangedChannel := make(chan StateSwitched)
+	id := r.stateManager.AddStateObserver(stateChangedChannel)
+
+	go func() {
+		defer func() {
+			r.stateManager.RemoveStateObserver(id)
+			close(stateChangedChannel)
+			close(roleChangedChannel)
+			close(finishChannel)
+		}()
+
+		for {
+			select {
+			case <-doneChannel:
+				return
+			case stateChangedEvent := <-stateChangedChannel:
+				if stateChangedEvent.newState.Role != currentRole {
+					currentRole = stateChangedEvent.newState.Role
+					roleChangedChannel <- currentRole
+				}
+			}
+		}
+	}()
+
+	return roleChangedChannel, finishChannel
 }
 
 // Should be closed only once
@@ -251,19 +306,20 @@ func (r *Raft) Close() {
 	<-r.runFinishedChannel
 }
 
-func (r *Raft) HandleRoleFollower(ctx context.Context, stateChangedChannel <-chan StateSwitched) <-chan RaftRole {
-	doneChannel := make(chan RaftRole)
+func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
+	doneChannel := make(chan struct{})
 
 	go func() {
 		electionTimeout := newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
 		electionTimedChannel := make(chan struct{})
 		defer close(electionTimedChannel)
 
-		// We will switch state in this goroutine after the follower times out
-		// and wait for the invoked event to come in order to return from the handler
 		go func() {
-			select {
-			case <-electionTimedChannel:
+			for {
+				if _, ok := <-electionTimedChannel; !ok {
+					return
+				}
+
 				r.stateMutex.Lock()
 
 				r.logger.Debugf("election timed out, therefore switching to CANDIDATE role")
@@ -273,83 +329,65 @@ func (r *Raft) HandleRoleFollower(ctx context.Context, stateChangedChannel <-cha
 				r.stateManager.SwitchState(newTerm, &votedFor, CANDIDATE)
 
 				r.stateMutex.Unlock()
-			case <-ctx.Done():
 			}
 		}()
 
-		serverRole := FOLLOWER
 	outerloop:
 		for {
 			select {
-			case stateChangedEvent := <-stateChangedChannel:
-				if stateChangedEvent.newState.Role == FOLLOWER {
-					break
+			case event, ok := <-r.appendEntriesHandlersChannel:
+				if !ok {
+					r.logger.Panicf("appendEntriesHandlersChannel was unexpectedly closed")
 				}
 
-				serverRole = stateChangedEvent.newState.Role
-				break outerloop
-			case event := <-r.appendEntriesHandlersChannel:
 				if event.byLeader {
 					electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
 				}
-			case event := <-r.requestVoteHandlersChannel:
+			case event, ok := <-r.requestVoteHandlersChannel:
+				if !ok {
+					r.logger.Panicf("requestVoteHandlersChannel was unexpectedly closed")
+				}
+
 				if event.voteGranted {
 					electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
 				}
 			case <-time.After(electionTimeout):
 				electionTimedChannel <- struct{}{}
+
+				// Reset election timeout, so that we won't be always falling into this case
+				// when it takes some time to propagate the new state
+				electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
 			case <-ctx.Done():
 				break outerloop
 			}
 		}
 
-		doneChannel <- serverRole
 		close(doneChannel)
 	}()
 
 	return doneChannel
 }
 
-func (r *Raft) HandleRoleCandidate(ctx context.Context, stateChangedChannel <-chan StateSwitched) <-chan RaftRole {
-	doneChannel := make(chan RaftRole)
+func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
+	doneChannel := make(chan struct{})
 
 	go func() {
-		// Firstly, check if the state hasn't been changed in the meantime
-	stateChangedLoop:
-		for {
-			select {
-			case stateChangedEvent := <-stateChangedChannel:
-				if stateChangedEvent.newState.Role == CANDIDATE {
-					break
-				}
-
-				doneChannel <- stateChangedEvent.newState.Role
-				close(doneChannel)
-				return
-			default:
-				break stateChangedLoop
-			}
-		}
-
 		electionTimeout := newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
 
 		innerCtx, cancel := context.WithTimeout(context.Background(), r.settings.MinElectionTimeout)
 		go r.broadcastRequestVote(innerCtx)
 
-		serverRole := CANDIDATE
 	outerloop:
 		for {
 			select {
-			case <-r.appendEntriesHandlersChannel:
-			case <-r.requestVoteHandlersChannel:
-			case stateChangedEvent := <-stateChangedChannel:
-				if stateChangedEvent.newState.Role == CANDIDATE {
-					break
+			case _, ok := <-r.appendEntriesHandlersChannel:
+				if !ok {
+					r.logger.Panicf("appendEntriesHandlersChannel was unexpectedly closed")
 				}
-
-				cancel()
-				serverRole = stateChangedEvent.newState.Role
-				break outerloop
+			case _, ok := <-r.requestVoteHandlersChannel:
+				if !ok {
+					r.logger.Panicf("requestVoteHandlersChannel was unexpectedly closed")
+				}
 			case <-time.After(electionTimeout):
 				cancel()
 				r.logger.Debugf("election timed out without a winner, broadcasting new vote")
@@ -358,12 +396,11 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context, stateChangedChannel <-ch
 				innerCtx, cancel = context.WithTimeout(context.Background(), r.settings.MinElectionTimeout)
 				go r.broadcastRequestVote(innerCtx)
 			case <-ctx.Done():
-				cancel()
 				break outerloop
 			}
 		}
 
-		doneChannel <- serverRole
+		cancel()
 		close(doneChannel)
 	}()
 
@@ -412,95 +449,116 @@ func (r *Raft) broadcastRequestVote(ctx context.Context) {
 	}
 }
 
-func (r *Raft) HandleRoleLeader(ctx context.Context, stateChangedChannel <-chan StateSwitched) <-chan RaftRole {
-	doneChannel := make(chan RaftRole)
+func (r *Raft) HandleRoleLeader(ctx context.Context) <-chan struct{} {
+	doneChannel := make(chan struct{})
 
 	go func() {
-		// Firstly, check if the state hasn't been changed in the meantime
-	stateChangedLoop:
-		for {
-			select {
-			case stateChangedEvent := <-stateChangedChannel:
-				if stateChangedEvent.newState.Role == LEADER {
-					break
-				}
+		innerCtx, cancel := context.WithCancel(ctx)
+		heartbeatFinishedChannel := r.broadcastHeartbeat(innerCtx.Done())
 
-				doneChannel <- stateChangedEvent.newState.Role
-				close(doneChannel)
-				return
-			default:
-				break stateChangedLoop
-			}
-		}
-
-		innerCtx, cancel := context.WithTimeout(context.Background(), r.settings.MinElectionTimeout)
-		go r.broadcastHeartbeat(innerCtx)
-
-		serverRole := LEADER
 	outerloop:
 		for {
 			select {
-			case <-r.appendEntriesHandlersChannel:
-			case <-r.requestVoteHandlersChannel:
-			case stateChangedEvent := <-stateChangedChannel:
-				if stateChangedEvent.newState.Role == LEADER {
-					break
+			case _, ok := <-r.appendEntriesHandlersChannel:
+				if !ok {
+					r.logger.Panicf("appendEntriesHandlersChannel was unexpectedly closed")
 				}
-
-				cancel()
-				serverRole = stateChangedEvent.newState.Role
-				break outerloop
-			case <-time.After(r.settings.HeartbeatFrequency):
-				cancel()
-
-				r.logger.Debugf("sending new heartbeat")
-
-				innerCtx, cancel = context.WithTimeout(context.Background(), r.settings.HeartbeatFrequency)
-				go r.broadcastHeartbeat(innerCtx)
+			case _, ok := <-r.requestVoteHandlersChannel:
+				if !ok {
+					r.logger.Panicf("requestVoteHandlersChannel was unexpectedly closed")
+				}
 			case <-ctx.Done():
-				cancel()
 				break outerloop
 			}
 		}
 
-		doneChannel <- serverRole
+		cancel()
+		<-heartbeatFinishedChannel
 		close(doneChannel)
 	}()
 
 	return doneChannel
 }
 
-// TODO: Add log repairing for failed nodes in heartbeat sending
-func (r *Raft) broadcastHeartbeat(ctx context.Context) {
-	r.stateMutex.RLock()
-	request := &pb.AppendEntriesRequest{
-		Term:         r.stateManager.GetCurrentTerm(),
-		LeaderId:     r.settings.ID,
-		PrevLogIndex: r.logManager.GetLastLogIndex(),
-		PrevLogTerm:  r.logManager.GetLastLogTerm(),
-		LeaderCommit: 0, // TODO
-		Entries:      make([]*pb.AppendEntriesRequest_Entry, 0),
-	}
-	r.stateMutex.RUnlock()
+func (r *Raft) broadcastHeartbeat(done <-chan struct{}) <-chan struct{} {
+	finishChannel := make(chan struct{})
 
-	responses := r.cluster.BroadcastAppendEntriesRPCs(ctx, request)
+	go func() {
+		defer close(finishChannel)
 
-	r.stateMutex.Lock()
-	defer r.stateMutex.Unlock()
+		for {
+			timedoutChannel := time.After(r.settings.HeartbeatFrequency)
 
-	// Check if we are still the leader
-	if r.stateManager.GetRole() != LEADER {
-		return
-	}
+			r.logger.Printf("broadcasting heartbeat")
 
-	// Check if any of the responses contains higher term,
-	// in which case we have to convert to FOLLOWER state
-	for _, response := range responses {
-		if response.GetTerm() > r.stateManager.GetCurrentTerm() {
-			r.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
-			return
+			r.stateMutex.RLock()
+			request := &pb.AppendEntriesRequest{
+				Term:         r.stateManager.GetCurrentTerm(),
+				LeaderId:     r.settings.ID,
+				PrevLogIndex: r.logManager.GetLastLogIndex(),
+				PrevLogTerm:  r.logManager.GetLastLogTerm(),
+				LeaderCommit: 0, // TODO
+				Entries:      make([]*pb.AppendEntriesRequest_Entry, 0),
+			}
+			r.stateMutex.RUnlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), r.settings.HeartbeatFrequency)
+			responseWrappers := r.cluster.BroadcastAppendEntriesRPCs(ctx, request)
+			cancel()
+
+			// Check if we are still the leader
+			r.stateMutex.RLock()
+			currentTerm := r.stateManager.GetCurrentTerm()
+			if r.stateManager.GetRole() != LEADER {
+				r.stateMutex.RUnlock()
+				r.logger.Debugf("not a leader anymore, therefore finishing broadcasting heartbeat")
+				return
+			}
+			r.stateMutex.RUnlock()
+
+			for _, responseWrapper := range responseWrappers {
+				// Check if any of the responses contains higher term,
+				// in which case we have to convert to FOLLOWER state
+				if responseWrapper.Error == nil && responseWrapper.Response.GetTerm() > currentTerm {
+					r.stateMutex.Lock()
+					r.stateManager.SwitchState(responseWrapper.Response.GetTerm(), nil, FOLLOWER)
+					r.stateMutex.Unlock()
+					return
+				}
+
+				// Retry the heartbeat if unsuccessful or gRPC errors occured
+				if responseWrapper.Error != nil || !responseWrapper.Response.GetSuccess() {
+					r.logger.Errorf("unable to broadcast heartbeat: %+v", responseWrapper)
+					retryChannel, ok := r.retryNodeHeartbeatChannels[responseWrapper.NodeID]
+					if !ok {
+						r.logger.Panicf("unable to find node ID %s in the retry node heartbeat channels: %+v",
+							responseWrapper.NodeID, r.retryNodeHeartbeatChannels)
+					}
+
+					// Do not wait for the channel to be empty,
+					// because a full channel here signifies there is already a heartbeat
+					// being retried to this particular node
+					heartbeatToRetry := &retryNodeAppendEntriesRequest{
+						OriginalRequest: request,
+						SuccessCallback: func() {},
+						FromError:       responseWrapper.Error,
+					}
+					select {
+					case retryChannel <- heartbeatToRetry:
+					default:
+					}
+				}
+			}
+
+			select {
+			case <-done:
+				return
+			case <-timedoutChannel:
+			}
 		}
-	}
+	}()
+
+	return finishChannel
 }
 
 // TODO: processAppendEntries and processRequestVote should be optimized (if possible)
@@ -572,10 +630,11 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				// We check if the index is correct
 				// index == startingLogIndex - 1 signifies we received first log
 				if previousLogIndex < startingLogIndex-1 {
+					r.stateMutex.Unlock()
 					logger.Panicf("received request with a previous index %d lower than the lower limit for log indexes",
 						previousLogIndex)
 				} else if previousLogIndex >= startingLogIndex {
-					log, err := r.logManager.FindLogByIndex(previousLogIndex)
+					term, err := r.logManager.FindTermAtIndex(previousLogIndex)
 					if err == persister.ErrIndexedLogDoesNotExists {
 						r.stateMutex.Unlock()
 						logger.Debugf("unable to find log with index: %+v", previousLogIndex)
@@ -586,7 +645,7 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 						logger.Panicf("failed when finding log by index %d: %+v", previousLogIndex, err)
 					}
 
-					if log.Term != request.GetPrevLogTerm() {
+					if term != request.GetPrevLogTerm() {
 						err := r.logManager.DeleteLogsAferIndex(previousLogIndex)
 						if err != nil {
 							r.stateMutex.Unlock()
@@ -605,7 +664,7 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 
 				if len(entries) != 0 {
 					logger.Debugf("appending entries")
-					err := r.logManager.AppendLogs(senderTerm, entries)
+					err := r.logManager.AppendEntries(entries)
 					if err != nil {
 						r.stateMutex.Unlock()
 						logger.Panicf("unable to append logs: %+v", err)
@@ -623,7 +682,6 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 		}
 
 		close(finishChannel)
-		close(r.appendEntriesHandlersChannel)
 	}()
 
 	return finishChannel
@@ -728,7 +786,6 @@ func (r *Raft) processRequestVote(done <-chan struct{}) <-chan struct{} {
 		}
 
 		close(finishChannel)
-		close(r.requestVoteHandlersChannel)
 	}()
 
 	return finishChannel
@@ -741,7 +798,12 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 		for {
 			// TODO: Allow get request processing while processing Create, Update or Delete
 			select {
-			case msg := <-r.clientRequestChannel:
+			case msg, ok := <-r.clientRequestChannel:
+				if !ok {
+					r.logger.Debugf("channel for processing client requests was closed")
+					break processLoop
+				}
+
 				switch request := msg.Request.(type) {
 				case *external_server.ClusterCreateRequest:
 					responseChannel := msg.ResponseChannel
@@ -833,11 +895,12 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 		&pb.AppendEntriesRequest_Entry{
 			Key:     request.Key,
 			Payload: request.Value,
+			Term:    currentTerm,
 		},
 	}
 
 	// Append client command to log
-	err := r.logManager.AppendLogs(currentTerm, newEntries)
+	err := r.logManager.AppendEntries(newEntries)
 	if err != nil {
 		r.logger.Errorf("unable to append logs while processing client create request: %+v", err)
 		return external_server.FailedInternal
@@ -876,21 +939,21 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 		r.logger.Printf("sending AppendEntries request: %+v", clusterRequest)
 
 		requestCtx, cancel := context.WithCancel(context.Background())
-		responses := r.cluster.BroadcastAppendEntriesRPCsAsync(requestCtx, clusterRequest)
+		responses := r.cluster.BroadcastAppendEntriesRPCs(requestCtx, clusterRequest)
+		cancel()
 
 		var countOfAcceptedReplies uint32 = 1
-		for responseWrapper := range responses {
+		for _, responseWrapper := range responses {
 			r.logger.Printf("received AppendEntries response: %+v", responseWrapper)
 
 			// This situation could happen under following conditions:
 			// We start replication -> receive majority -> network partition occurs.
 			// We are not the leader anymore and all servers that did not replicate
 			// our AppendEntries will have higher term
-			if responseWrapper.Response.GetTerm() > currentTerm {
+			if responseWrapper.Error == nil && responseWrapper.Response.GetTerm() > currentTerm {
 				r.stateMutex.Lock()
 				r.stateManager.SwitchState(responseWrapper.Response.GetTerm(), nil, FOLLOWER)
 				r.stateMutex.Unlock()
-				cancel()
 
 				majorityReachedChannel <- external_server.Redirect
 				return
@@ -902,12 +965,12 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 				sendMajorityReachedResponse(int(value))
 			}
 
-			if !responseWrapper.Response.GetSuccess() {
+			if responseWrapper.Error != nil || !responseWrapper.Response.GetSuccess() {
 				nodeChannel := r.retryNodeAppendEntriesChannels[responseWrapper.NodeID]
 				nodeChannel <- &retryNodeAppendEntriesRequest{
-					Context:         requestCtx,
 					OriginalRequest: clusterRequest,
 					SuccessCallback: successCallback,
+					FromError:       responseWrapper.Error,
 				}
 
 				continue
@@ -935,79 +998,95 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 				r.retryNodeAppendEntriesChannels)
 		}
 
+		heartbeatChannel, ok := r.retryNodeHeartbeatChannels[nodeID]
+		if !ok {
+			r.logger.Panicf("no channel for node %s in the map for retrying heartbeats: %+v", nodeID,
+				r.retryNodeHeartbeatChannels)
+		}
+
+		contextCanceller := func(ctx context.Context, CancelFunc func()) {
+			select {
+			case <-done:
+				CancelFunc()
+			case <-ctx.Done():
+			}
+		}
+
 	processLoop:
 		for {
-		requestLoop:
+			var requestWrapper *retryNodeAppendEntriesRequest
+
 			select {
-			case requestWrapper := <-requestChannel:
-				for {
-					select {
-					case <-requestWrapper.Context.Done():
-						break requestLoop
-					default:
-					}
-
-					prevLogIndex := requestWrapper.OriginalRequest.PrevLogIndex - 1
-					if prevLogIndex < startingLogIndex-1 {
-						r.logger.Panicf("node could not accept applying log at index: %+v", prevLogIndex)
-					}
-
-					var term uint64
-					if prevLogIndex == startingLogIndex-1 {
-						term = startingTerm
-					} else {
-						log, err := r.logManager.FindLogByIndex(prevLogIndex)
-						if err != nil {
-							r.logger.Panicf("unable to find log for index %d: %+v", prevLogIndex, err)
-						}
-
-						term = log.Term
-					}
-
-					r.stateMutex.RLock()
-					currentTerm := r.stateManager.GetCurrentTerm()
-					r.stateMutex.RUnlock()
-
-					newRequest := &pb.AppendEntriesRequest{
-						Term:         currentTerm,
-						LeaderId:     r.settings.ID,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  term,
-						LeaderCommit: 0, // TODO
-						Entries:      requestWrapper.OriginalRequest.Entries,
-					}
-
-					r.logger.Printf("retrying AppendEntries request: %+v", newRequest)
-
-					// SendAppendEntries will continue retrying until it receives a response
-					responseChannel, err := r.cluster.SendAppendEntries(requestWrapper.Context, nodeID, newRequest)
-					if err != nil {
-						// This is a non-gRPC request related error, e.g. nodeID is wrong
-						r.logger.Panicf("unable to call SendAppendEntries due to: %+v", err)
-					}
-
-					response := <-responseChannel
-
-					r.logger.Printf("received AppendEntries retry response: %+v", response)
-
-					// Check if the node does not have a higher term
-					// If this happens here, it means that more than a majority of servers
-					// are on a higher term, therefore we can throw away this request
-					if response.GetTerm() > currentTerm {
-						r.stateMutex.Lock()
-						r.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
-						r.stateMutex.Unlock()
-						break requestLoop
-					}
-
-					if response.GetSuccess() {
-						requestWrapper.SuccessCallback()
-					}
-
-					break requestLoop
-				}
+			case requestWrapper = <-heartbeatChannel:
+			case requestWrapper = <-requestChannel:
 			case <-done:
 				break processLoop
+			}
+
+			request := requestWrapper.OriginalRequest
+			successCallback := requestWrapper.SuccessCallback
+			fromError := requestWrapper.FromError
+
+		requestLoop:
+			for {
+				select {
+				case <-done:
+					break processLoop
+				default:
+				}
+
+				// Check if we are not the leader
+				// If we are not, we can safely finish retrying this request,
+				// because the new leader will have it replicated (if it was committed)
+				// or it won't (if the client request failed)
+				r.stateMutex.RLock()
+				if r.stateManager.GetRole() != LEADER {
+					r.stateMutex.RUnlock()
+					break requestLoop
+				}
+
+				currentTerm := r.stateManager.GetCurrentTerm()
+				r.stateMutex.RUnlock()
+
+				// Create new request
+				newRequest := request
+				if fromError == nil {
+					newRequest = r.moveRequest(request)
+				}
+
+				r.logger.Printf("retrying AppendEntries request: %+v", newRequest)
+
+				// SendAppendEntries will continue retrying until it receives a response
+				ctx, cancel := context.WithCancel(context.Background())
+				go contextCanceller(ctx, cancel)
+				response, err := r.cluster.SendAppendEntries(ctx, nodeID, newRequest)
+				cancel()
+				if err == context.Canceled || err == context.DeadlineExceeded {
+					r.logger.Printf("retrying ended: %+v", err)
+					break requestLoop
+				} else if err != nil {
+					// This is a non-gRPC request related error, e.g. nodeID is wrong
+					r.logger.Panicf("unable to call SendAppendEntries due to: %+v", err)
+				}
+
+				r.logger.Printf("received AppendEntries retry response: %+v", response)
+
+				// Check if the node does not have a higher term
+				// If this happens here, it means that more than a majority of servers
+				// are on a higher term, therefore we can throw away this request
+				if response.GetTerm() > currentTerm {
+					r.stateMutex.Lock()
+					r.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
+					r.stateMutex.Unlock()
+					break requestLoop
+				}
+
+				if response.GetSuccess() {
+					successCallback()
+					break requestLoop
+				}
+
+				request = newRequest
 			}
 		}
 
@@ -1015,6 +1094,41 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 	}()
 
 	return finishChannel
+}
+
+func (r *Raft) moveRequest(oldRequest *pb.AppendEntriesRequest) *pb.AppendEntriesRequest {
+	r.stateMutex.RLock()
+	currentTerm := r.stateManager.GetCurrentTerm()
+	r.stateMutex.RUnlock()
+
+	var term uint64 = startingTerm
+	prevLogIndex := oldRequest.PrevLogIndex - 1
+	if prevLogIndex < startingLogIndex-1 {
+		r.logger.Panicf("node could not accept applying log at index: %+v", prevLogIndex)
+	} else if prevLogIndex > startingLogIndex-1 {
+		var err error
+		term, err = r.logManager.FindTermAtIndex(prevLogIndex)
+		if err != nil {
+			r.logger.Panicf("unable to find log for index %d: %+v", prevLogIndex, err)
+		}
+	}
+
+	// Add last log to the entries
+	entry, err := r.logManager.FindEntryAtIndex(oldRequest.PrevLogIndex)
+	if err != nil {
+		r.logger.Panicf("unable to find log for index %d: %+v", oldRequest.PrevLogIndex, err)
+	}
+
+	oldRequest.Entries = append(oldRequest.Entries, entry)
+
+	return &pb.AppendEntriesRequest{
+		Term:         currentTerm,
+		LeaderId:     r.settings.ID,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  term,
+		LeaderCommit: 0, // TODO
+		Entries:      oldRequest.Entries,
+	}
 }
 
 func (r *Raft) processClientGetRequest(request *external_server.ClusterGetRequest) ([]byte, external_server.ClusterStatusCode) {
@@ -1030,8 +1144,8 @@ func (r *Raft) processClientGetRequest(request *external_server.ClusterGetReques
 
 	// TODO: The node might not be the leader (but doesn't know it)
 	// so that we might still get stale data
-	result := r.stateMachine.Get(request.Key)
-	if result == nil {
+	result, ok := r.stateMachine.Get(request.Key)
+	if !ok {
 		return nil, external_server.FailedNotFound
 	}
 

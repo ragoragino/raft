@@ -3,13 +3,14 @@ package node
 import (
 	"context"
 	"fmt"
-	logrus "github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
-	grpc_backoff "google.golang.org/grpc/backoff"
 	"math/rand"
 	pb "raft/internal/core/node/gen"
 	"sync"
 	"time"
+
+	logrus "github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
+	grpc_backoff "google.golang.org/grpc/backoff"
 )
 
 type clusterOptions struct {
@@ -45,8 +46,9 @@ type ClusterState struct {
 	nodes          []string
 }
 
-type AppendEntriesAsyncResponseWrapper struct {
+type AppendEntriesResponseWrapper struct {
 	Response *pb.AppendEntriesResponse
+	Error    error
 	NodeID   string
 }
 
@@ -56,10 +58,9 @@ type ICluster interface {
 
 	GetClusterState() ClusterState
 	SetLeader(leaderName string) error
-	SendAppendEntries(ctx context.Context, nodeID string, newRequest *pb.AppendEntriesRequest) (<-chan *pb.AppendEntriesResponse, error)
+	SendAppendEntries(ctx context.Context, nodeID string, request *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error)
 	BroadcastRequestVoteRPCs(ctx context.Context, request *pb.RequestVoteRequest) []*pb.RequestVoteResponse
-	BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.AppendEntriesRequest) []*pb.AppendEntriesResponse
-	BroadcastAppendEntriesRPCsAsync(ctx context.Context, request *pb.AppendEntriesRequest) <-chan *AppendEntriesAsyncResponseWrapper
+	BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.AppendEntriesRequest) []*AppendEntriesResponseWrapper
 }
 
 type NodeInfo struct {
@@ -183,7 +184,7 @@ func (c *Cluster) SetLeader(leaderName string) error {
 	return fmt.Errorf("leader with this name was not found in the list of nodes: %s", leaderName)
 }
 
-func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request *pb.AppendEntriesRequest) (<-chan *pb.AppendEntriesResponse, error) {
+func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	var destinationNode *NodeInfo
 
 	// TODO: Does it make sense to optimize this to map?
@@ -197,30 +198,22 @@ func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request 
 		return nil, fmt.Errorf("unable to find node %s in a slice of nodes: %+v", nodeID, c.nodes)
 	}
 
-	responseChannel := make(chan *pb.AppendEntriesResponse)
-	go func() {
-		defer close(responseChannel)
+	backoffer := c.exponentialBackofferFactory.NewExponentialBackoffer()
+	for {
+		c.logger.Debugf("sending RPC AppendEntries to client %s for the %d time", nodeID, backoffer.retries)
 
-		backoffer := c.exponentialBackofferFactory.NewExponentialBackoffer()
-		for {
-			c.logger.Debugf("sending RPC AppendEntries to client %s for the %d time", nodeID, backoffer.retries)
+		resp, err := destinationNode.client.AppendEntries(ctx, request)
 
-			resp, err := destinationNode.client.AppendEntries(ctx, request)
+		c.logger.Debugf("received response for RPC AppendEntries %+v and error %+v from client: %s", resp, err, nodeID)
 
-			c.logger.Debugf("received response from RPC AppendEntries %+v from client: %s", resp, nodeID)
-
-			if err == nil {
-				responseChannel <- resp
-				return
-			} else if err == context.Canceled {
-				return
-			}
-
-			time.Sleep(backoffer.Do())
+		if err == nil {
+			return resp, nil
+		} else if err == context.Canceled || err == context.DeadlineExceeded {
+			return nil, err
 		}
-	}()
 
-	return responseChannel, nil
+		time.Sleep(backoffer.Do())
+	}
 }
 
 func (c *Cluster) BroadcastRequestVoteRPCs(ctx context.Context, request *pb.RequestVoteRequest) []*pb.RequestVoteResponse {
@@ -258,79 +251,34 @@ func (c *Cluster) BroadcastRequestVoteRPCs(ctx context.Context, request *pb.Requ
 	return responses
 }
 
-func (c *Cluster) BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.AppendEntriesRequest) []*pb.AppendEntriesResponse {
-	responses := make([]*pb.AppendEntriesResponse, 0, len(c.nodes))
-	responseChannel := make(chan *pb.AppendEntriesResponse, len(c.nodes))
+func (c *Cluster) BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.AppendEntriesRequest) []*AppendEntriesResponseWrapper {
+	responses := make([]*AppendEntriesResponseWrapper, len(c.nodes))
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(c.nodes))
 
-	for _, node := range c.nodes {
-		go func(node *NodeInfo) {
+	for i, node := range c.nodes {
+		go func(i int, node *NodeInfo) {
 			defer wg.Done()
 
-			c.logger.Debugf("sending RPC AppendEntries to client: %s", node.name)
+			c.logger.Debugf("sending RPC AppendEntries to client %s: %+v", node.name, request)
 
+			// TODO: Retry policy
 			resp, err := node.client.AppendEntries(ctx, request)
-			if err != nil {
-				c.logger.Errorf("unable to RPC AppendEntries to client %+v because: %+v", node.name, err)
-				return
+
+			c.logger.Debugf("received response from RPC AppendEntries %+v and error %+v from client: %s", resp, err, node.name)
+
+			responses[i] = &AppendEntriesResponseWrapper{
+				Error:    err,
+				Response: resp,
+				NodeID:   node.name,
 			}
-
-			c.logger.Debugf("received response from RPC AppendEntries %+v from client: %s", resp, node.name)
-
-			responseChannel <- resp
-		}(node)
+		}(i, node)
 	}
 
 	wg.Wait()
-	close(responseChannel)
-
-	for resp := range responseChannel {
-		responses = append(responses, resp)
-	}
 
 	return responses
-}
-
-func (c *Cluster) BroadcastAppendEntriesRPCsAsync(ctx context.Context, request *pb.AppendEntriesRequest) <-chan *AppendEntriesAsyncResponseWrapper {
-	responseChannel := make(chan *AppendEntriesAsyncResponseWrapper, len(c.nodes))
-
-	go func() {
-		wg := sync.WaitGroup{}
-		wg.Add(len(c.nodes))
-
-		for _, node := range c.nodes {
-			go func(node *NodeInfo) {
-				defer wg.Done()
-
-				backoffer := c.exponentialBackofferFactory.NewExponentialBackoffer()
-				for {
-					c.logger.Debugf("sending RPC AppendEntries to client for the %d time: %s", backoffer.retries, node.name)
-
-					resp, err := node.client.AppendEntries(ctx, request)
-					c.logger.Debugf("received response from RPC AppendEntries %+v from client: %s", resp, node.name)
-
-					if err == nil {
-						responseChannel <- &AppendEntriesAsyncResponseWrapper{
-							Response: resp,
-							NodeID:   node.name,
-						}
-						return
-					} else if err == context.Canceled {
-						return
-					}
-
-					time.Sleep(backoffer.Do())
-				}
-			}(node)
-		}
-
-		wg.Wait()
-		close(responseChannel)
-	}()
-
-	return responseChannel
 }
 
 type ExponentialBackofferFactory struct {
