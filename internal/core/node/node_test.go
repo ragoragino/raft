@@ -142,7 +142,10 @@ func startClusterServers(t *testing.T, clusterServers map[string]*ClusterServer)
 		go func(clusterServer *ClusterServer) {
 			defer wgServer.Done()
 			err := clusterServer.Run()
-			assert.NoError(t, err)
+			if err != nil {
+				fmt.Errorf("running cluster server failed: %+v", err)
+				t.FailNow()
+			}
 		}(clusterServer)
 	}
 
@@ -184,7 +187,10 @@ func startHttpServer(t *testing.T, httpServers map[string]external_server.Interf
 		go func(server external_server.Interface) {
 			defer wgHTTP.Done()
 			err := server.Run()
-			assert.NoError(t, err)
+			if err != nil {
+				fmt.Errorf("running http server failed: %+v", err)
+				t.FailNow()
+			}
 		}(httpServer)
 	}
 
