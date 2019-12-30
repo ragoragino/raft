@@ -5,6 +5,7 @@ package node
 import (
 	"context"
 	// "github.com/sasha-s/go-deadlock"
+	"github.com/google/uuid"
 	"math"
 	"math/rand"
 	pb "raft/internal/core/node/gen"
@@ -101,6 +102,8 @@ func (s RaftRole) String() string {
 const (
 	startingLogIndex = 1
 	startingTerm     = 0
+
+	requestIDKey = "id"
 )
 
 type clientLog struct {
@@ -117,6 +120,7 @@ type requestVoteEvent struct {
 }
 
 type retryNodeAppendEntriesRequest struct {
+	Context         context.Context
 	OriginalRequest *pb.AppendEntriesRequest
 	SuccessCallback func()
 	FromError       error
@@ -374,7 +378,9 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
 	go func() {
 		electionTimeout := newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
 
-		innerCtx, cancel := context.WithTimeout(context.Background(), r.settings.MinElectionTimeout)
+		ctxWithRequestID := createNewRequestContext()
+
+		innerCtx, cancel := context.WithTimeout(ctxWithRequestID, r.settings.MinElectionTimeout)
 		go r.broadcastRequestVote(innerCtx)
 
 	outerloop:
@@ -393,7 +399,7 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
 				r.logger.Debugf("election timed out without a winner, broadcasting new vote")
 
 				electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
-				innerCtx, cancel = context.WithTimeout(context.Background(), r.settings.MinElectionTimeout)
+				innerCtx, cancel = context.WithTimeout(ctxWithRequestID, r.settings.MinElectionTimeout)
 				go r.broadcastRequestVote(innerCtx)
 			case <-ctx.Done():
 				break outerloop
@@ -491,6 +497,8 @@ func (r *Raft) broadcastHeartbeat(done <-chan struct{}) <-chan struct{} {
 
 			r.logger.Printf("broadcasting heartbeat")
 
+			ctxWithRequestID := createNewRequestContext()
+
 			r.stateMutex.RLock()
 			request := &pb.AppendEntriesRequest{
 				Term:         r.stateManager.GetCurrentTerm(),
@@ -502,7 +510,7 @@ func (r *Raft) broadcastHeartbeat(done <-chan struct{}) <-chan struct{} {
 			}
 			r.stateMutex.RUnlock()
 
-			ctx, cancel := context.WithTimeout(context.Background(), r.settings.HeartbeatFrequency)
+			ctx, cancel := context.WithTimeout(ctxWithRequestID, r.settings.HeartbeatFrequency)
 			responseWrappers := r.cluster.BroadcastAppendEntriesRPCs(ctx, request)
 			cancel()
 
@@ -539,6 +547,7 @@ func (r *Raft) broadcastHeartbeat(done <-chan struct{}) <-chan struct{} {
 					// because a full channel here signifies there is already a heartbeat
 					// being retried to this particular node
 					heartbeatToRetry := &retryNodeAppendEntriesRequest{
+						Context:         ctxWithRequestID,
 						OriginalRequest: request,
 						SuccessCallback: func() {},
 						FromError:       responseWrapper.Error,
@@ -580,7 +589,8 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				request := appendEntryToProcess.Request
 				responseChannel := appendEntryToProcess.ResponseChannel
 
-				logger := r.logger.WithFields(logrus.Fields{"RPC": "AppendEntries", "Sender": request.GetLeaderId()})
+				logger := loggerFromContext(r.logger, appendEntryToProcess.Context)
+				logger = logger.WithFields(logrus.Fields{"RPC": "AppendEntries", "Sender": request.GetLeaderId()})
 
 				logger.Debugf("received RPC: %+v", request)
 
@@ -705,7 +715,8 @@ func (r *Raft) processRequestVote(done <-chan struct{}) <-chan struct{} {
 
 				candidateID := request.GetCandidateId()
 
-				logger := r.logger.WithFields(logrus.Fields{"RPC": "RequestVote", "Sender": candidateID})
+				logger := loggerFromContext(r.logger, requestVoteToProcess.Context)
+				logger = logger.WithFields(logrus.Fields{"RPC": "RequestVote", "Sender": candidateID})
 
 				logger.Debugf("received RPC: %+v", request)
 
@@ -804,11 +815,14 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 					break processLoop
 				}
 
+				ctx := contextFromExternalServerContext(msg.Context)
+				logger := loggerFromContext(r.logger, ctx)
+
 				switch request := msg.Request.(type) {
 				case *external_server.ClusterCreateRequest:
 					responseChannel := msg.ResponseChannel
 
-					statusCode := r.processClientCreateRequest(msg.Context, request)
+					statusCode := r.processClientCreateRequest(ctx, request)
 					if statusCode == external_server.Redirect {
 						clusterState := r.cluster.GetClusterState()
 
@@ -828,7 +842,7 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 				case *external_server.ClusterGetRequest:
 					responseChannel := msg.ResponseChannel
 
-					value, statusCode := r.processClientGetRequest(request)
+					value, statusCode := r.processClientGetRequest(ctx, request)
 					if statusCode == external_server.Redirect {
 						clusterState := r.cluster.GetClusterState()
 
@@ -847,7 +861,7 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 						Value:      value,
 					}
 				default:
-					r.logger.Panicf("received unknown HTTP request: %+v", request)
+					logger.Panicf("received unknown HTTP request: %+v", request)
 				}
 			case <-done:
 				break processLoop
@@ -871,7 +885,9 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 // Meanwhile, all goroutines spawned by this function will have closed
 // by the time of client timeout.
 func (r *Raft) processClientCreateRequest(ctx context.Context, request *external_server.ClusterCreateRequest) external_server.ClusterStatusCode {
-	r.logger.Printf("received client create request: %+v", request)
+	logger := loggerFromContext(r.logger, ctx)
+
+	logger.Printf("received client create request: %+v", request)
 
 	r.stateMutex.RLock()
 
@@ -879,7 +895,7 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 	role := r.stateManager.GetRole()
 	if role != LEADER {
 		r.stateMutex.RUnlock()
-		r.logger.Errorf("unable to continue with processing client create request - not a leader")
+		logger.Errorf("unable to continue with processing client create request - not a leader")
 		return external_server.Redirect
 	}
 
@@ -902,7 +918,7 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 	// Append client command to log
 	err := r.logManager.AppendEntries(newEntries)
 	if err != nil {
-		r.logger.Errorf("unable to append logs while processing client create request: %+v", err)
+		logger.Errorf("unable to append logs while processing client create request: %+v", err)
 		return external_server.FailedInternal
 	}
 
@@ -936,15 +952,16 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 			}
 		}
 
-		r.logger.Printf("sending AppendEntries request: %+v", clusterRequest)
+		logger.Printf("sending AppendEntries request: %+v", clusterRequest)
 
-		requestCtx, cancel := context.WithCancel(context.Background())
+		ctxWithRequestID := createNewRequestContext()
+		requestCtx, cancel := context.WithCancel(ctxWithRequestID)
 		responses := r.cluster.BroadcastAppendEntriesRPCs(requestCtx, clusterRequest)
 		cancel()
 
 		var countOfAcceptedReplies uint32 = 1
 		for _, responseWrapper := range responses {
-			r.logger.Printf("received AppendEntries response: %+v", responseWrapper)
+			logger.Printf("received AppendEntries response: %+v", responseWrapper)
 
 			// This situation could happen under following conditions:
 			// We start replication -> receive majority -> network partition occurs.
@@ -968,6 +985,7 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 			if responseWrapper.Error != nil || !responseWrapper.Response.GetSuccess() {
 				nodeChannel := r.retryNodeAppendEntriesChannels[responseWrapper.NodeID]
 				nodeChannel <- &retryNodeAppendEntriesRequest{
+					Context:         ctxWithRequestID,
 					OriginalRequest: clusterRequest,
 					SuccessCallback: successCallback,
 					FromError:       responseWrapper.Error,
@@ -1026,6 +1044,9 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 			request := requestWrapper.OriginalRequest
 			successCallback := requestWrapper.SuccessCallback
 			fromError := requestWrapper.FromError
+			ctxWithRequestID := requestWrapper.Context
+
+			logger := loggerFromContext(r.logger, ctxWithRequestID)
 
 		requestLoop:
 			for {
@@ -1051,25 +1072,25 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 				// Create new request
 				newRequest := request
 				if fromError == nil {
-					newRequest = r.moveRequest(request)
+					newRequest = r.moveRequest(ctxWithRequestID, request)
 				}
 
-				r.logger.Printf("retrying AppendEntries request: %+v", newRequest)
+				logger.Printf("retrying AppendEntries request: %+v", newRequest)
 
 				// SendAppendEntries will continue retrying until it receives a response
-				ctx, cancel := context.WithCancel(context.Background())
+				ctx, cancel := context.WithCancel(ctxWithRequestID)
 				go contextCanceller(ctx, cancel)
 				response, err := r.cluster.SendAppendEntries(ctx, nodeID, newRequest)
 				cancel()
 				if err == context.Canceled || err == context.DeadlineExceeded {
-					r.logger.Printf("retrying ended: %+v", err)
+					logger.Printf("retrying ended: %+v", err)
 					break requestLoop
 				} else if err != nil {
 					// This is a non-gRPC request related error, e.g. nodeID is wrong
-					r.logger.Panicf("unable to call SendAppendEntries due to: %+v", err)
+					logger.Panicf("unable to call SendAppendEntries due to: %+v", err)
 				}
 
-				r.logger.Printf("received AppendEntries retry response: %+v", response)
+				logger.Printf("received AppendEntries retry response: %+v", response)
 
 				// Check if the node does not have a higher term
 				// If this happens here, it means that more than a majority of servers
@@ -1096,7 +1117,9 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 	return finishChannel
 }
 
-func (r *Raft) moveRequest(oldRequest *pb.AppendEntriesRequest) *pb.AppendEntriesRequest {
+func (r *Raft) moveRequest(ctx context.Context, oldRequest *pb.AppendEntriesRequest) *pb.AppendEntriesRequest {
+	logger := loggerFromContext(r.logger, ctx)
+
 	r.stateMutex.RLock()
 	currentTerm := r.stateManager.GetCurrentTerm()
 	r.stateMutex.RUnlock()
@@ -1104,19 +1127,19 @@ func (r *Raft) moveRequest(oldRequest *pb.AppendEntriesRequest) *pb.AppendEntrie
 	var term uint64 = startingTerm
 	prevLogIndex := oldRequest.PrevLogIndex - 1
 	if prevLogIndex < startingLogIndex-1 {
-		r.logger.Panicf("node could not accept applying log at index: %+v", prevLogIndex)
+		logger.Panicf("node could not accept applying log at index: %+v", prevLogIndex)
 	} else if prevLogIndex > startingLogIndex-1 {
 		var err error
 		term, err = r.logManager.FindTermAtIndex(prevLogIndex)
 		if err != nil {
-			r.logger.Panicf("unable to find log for index %d: %+v", prevLogIndex, err)
+			logger.Panicf("unable to find log for index %d: %+v", prevLogIndex, err)
 		}
 	}
 
 	// Add last log to the entries
 	entry, err := r.logManager.FindEntryAtIndex(oldRequest.PrevLogIndex)
 	if err != nil {
-		r.logger.Panicf("unable to find log for index %d: %+v", oldRequest.PrevLogIndex, err)
+		logger.Panicf("unable to find log for index %d: %+v", oldRequest.PrevLogIndex, err)
 	}
 
 	oldRequest.Entries = append(oldRequest.Entries, entry)
@@ -1131,8 +1154,10 @@ func (r *Raft) moveRequest(oldRequest *pb.AppendEntriesRequest) *pb.AppendEntrie
 	}
 }
 
-func (r *Raft) processClientGetRequest(request *external_server.ClusterGetRequest) ([]byte, external_server.ClusterStatusCode) {
-	r.logger.Printf("received client get request: %+v", request)
+func (r *Raft) processClientGetRequest(ctx context.Context, request *external_server.ClusterGetRequest) ([]byte, external_server.ClusterStatusCode) {
+	logger := loggerFromContext(r.logger, ctx)
+
+	logger.Printf("received client get request: %+v", request)
 
 	r.stateMutex.RLock()
 	role := r.stateManager.GetRole()
@@ -1169,4 +1194,21 @@ func newElectionTimeout(min time.Duration, max time.Duration) time.Duration {
 	electionTimeout := min + electionTimeoutRandNano
 
 	return electionTimeout
+}
+
+func createNewRequestContext() context.Context {
+	return context.WithValue(context.Background(), requestIDKey, uuid.New().String())
+}
+
+func loggerFromContext(logger *logrus.Entry, ctx context.Context) *logrus.Entry {
+	id := ctx.Value(requestIDKey)
+
+	return logger.WithFields(logrus.Fields{
+		requestIDKey: id,
+	})
+}
+
+func contextFromExternalServerContext(ctx context.Context) context.Context {
+	id := ctx.Value(external_server.RequestIDKey)
+	return context.WithValue(ctx, requestIDKey, id)
 }

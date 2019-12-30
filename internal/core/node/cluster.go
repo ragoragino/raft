@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"google.golang.org/grpc/metadata"
 	"math/rand"
 	pb "raft/internal/core/node/gen"
 	"sync"
@@ -103,7 +104,7 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 
 	for name, endpoint := range otherNodes {
 		conn, err := grpc.DialContext(ctx, endpoint, grpc.WithInsecure(), grpc.WithAuthority(endpoint),
-			grpc.WithBlock())
+			grpc.WithBlock(), grpc.WithUnaryInterceptor(metadataSettingInterceptor))
 		if err != nil {
 			for _, node := range nodes {
 				err := node.connection.Close()
@@ -324,4 +325,15 @@ func (eb *ExpontialBackoffer) Do() time.Duration {
 	}
 
 	return time.Duration(backoff)
+}
+
+func metadataSettingInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	ctx = grpcMetadataFromContext(ctx)
+	return invoker(ctx, method, req, reply, cc, opts...)
+}
+
+func grpcMetadataFromContext(ctx context.Context) context.Context {
+	// If there is no request ID, it is a bug
+	value := ctx.Value(requestIDKey).(string)
+	return metadata.AppendToOutgoingContext(ctx, requestIDKey, value)
 }

@@ -10,6 +10,7 @@ import (
 
 	logrus "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 type serverOptions struct {
@@ -50,6 +51,7 @@ type appendEntriesProcessResponse struct {
 }
 
 type appendEntriesProcessRequest struct {
+	Context         context.Context
 	Request         *pb.AppendEntriesRequest
 	ResponseChannel chan<- appendEntriesProcessResponse
 }
@@ -60,6 +62,7 @@ type requestVoteProcessResponse struct {
 }
 
 type requestVoteProcessRequest struct {
+	Context         context.Context
 	Request         *pb.RequestVoteRequest
 	ResponseChannel chan<- requestVoteProcessResponse
 }
@@ -82,7 +85,7 @@ func NewClusterServer(logger *logrus.Entry, opts ...ServerCallOption) *ClusterSe
 		logger:             logger,
 	}
 
-	clusterServer.grpcServer = grpc.NewServer()
+	clusterServer.grpcServer = grpc.NewServer(grpc.UnaryInterceptor(contextGettingInterceptor))
 	pb.RegisterNodeServer(clusterServer.grpcServer, clusterServer)
 
 	return clusterServer
@@ -136,6 +139,7 @@ func (s *ClusterServer) AppendEntries(ctx context.Context, request *pb.AppendEnt
 	responseChannel := make(chan appendEntriesProcessResponse)
 
 	s.appendEntriesProcessChannel <- appendEntriesProcessRequest{
+		Context:         ctx,
 		Request:         request,
 		ResponseChannel: responseChannel,
 	}
@@ -151,6 +155,7 @@ func (s *ClusterServer) RequestVote(ctx context.Context, request *pb.RequestVote
 	responseChannel := make(chan requestVoteProcessResponse)
 
 	s.requestVoteProcessChannel <- requestVoteProcessRequest{
+		Context:         ctx,
 		Request:         request,
 		ResponseChannel: responseChannel,
 	}
@@ -160,4 +165,21 @@ func (s *ClusterServer) RequestVote(ctx context.Context, request *pb.RequestVote
 	close(responseChannel)
 
 	return response.Response, response.Error
+}
+
+func contextGettingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	ctx = contextFromGrpcMetadata(ctx)
+	return handler(ctx, req)
+}
+
+func contextFromGrpcMetadata(ctx context.Context) context.Context {
+	// If there is no request ID, it is a bug
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		panic(fmt.Sprintf("no metadata present in the ctx: %+v", ctx))
+	} else if len(md[requestIDKey]) != 1 {
+		panic(fmt.Sprintf("not a single request ID key present in the metadata: %+v", md))
+	}
+
+	return context.WithValue(ctx, requestIDKey, md[requestIDKey][0])
 }
