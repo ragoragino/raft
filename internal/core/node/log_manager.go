@@ -106,12 +106,7 @@ func (l *LogEntryManager) GetEntriesBetweenIndexes(startIndex uint64, endIndex u
 	}
 
 	for iterator.Next() {
-		log, err := iterator.Value()
-		if err != nil {
-			iterator.Close()
-			return nil, err
-		}
-
+		log := iterator.Value()
 		entry := &pb.AppendEntriesRequest_Entry{}
 		err = proto.Unmarshal(log.Command, entry)
 		if err != nil {

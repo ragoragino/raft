@@ -452,7 +452,21 @@ func (r *Raft) broadcastRequestVote(ctx context.Context) {
 
 	// Check if majority reached
 	if r.checkClusterMajority(countOfVotes) {
-		// Set commit index to the last log index and then switch state to follower
+		// Check if there isn't a discrepancy between our local committed index and the index
+		// with which we have been elected. If so, apply the missing entries to the state machine
+		lastCommittedIndex := r.stateManager.GetCommitIndex()
+		if lastCommittedIndex < lastLogIndex {
+			logEntriesToCommit, err := r.logManager.GetEntriesBetweenIndexes(lastCommittedIndex, lastLogIndex)
+			if err != nil {
+				r.logger.Panicf("unable to find entry at indexes %d:%d: %+v", lastCommittedIndex, lastLogIndex, err)
+			}
+
+			for _, logEntryToCommit := range logEntriesToCommit {
+				r.logger.Debugf("applying log entry %+v to state machine", logEntryToCommit)
+				r.stateMachine.Create(logEntryToCommit.GetKey(), logEntryToCommit.GetPayload())
+			}
+		}
+
 		r.stateManager.SetCommitIndex(lastLogIndex)
 		r.stateManager.SwitchPersistentState(r.stateManager.GetCurrentTerm(), nil, LEADER)
 	}
@@ -692,18 +706,17 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				// Leader should always have his commitIndex lower than the
 				// last entry that is being sent
 				if leaderCommit > lastCommittedIndex {
-					logger.Debugf("commit state: %+v, %+v", leaderCommit, lastCommittedIndex)
 					r.stateManager.SetCommitIndex(leaderCommit)
 
 					// Update the key in the state machine
 					logEntriesToCommit, err := r.logManager.GetEntriesBetweenIndexes(lastCommittedIndex, leaderCommit)
 					if err != nil {
 						r.stateMutex.Unlock()
-						logger.Panicf("unable to find entry at index %d: %+v", leaderCommit, err)
+						logger.Panicf("unable to find entry at indexes %d:%d: %+v", lastCommittedIndex, leaderCommit, err)
 					}
 
 					for _, logEntryToCommit := range logEntriesToCommit {
-						logger.Debugf("applying key %+v to state machine", logEntryToCommit.GetKey())
+						logger.Debugf("applying log entry %+v to state machine", logEntryToCommit)
 						r.stateMachine.Create(logEntryToCommit.GetKey(), logEntryToCommit.GetPayload())
 					}
 				}

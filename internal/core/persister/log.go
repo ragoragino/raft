@@ -55,9 +55,9 @@ type ILogEntryPersister interface {
 }
 
 type ILogEntryPersisterIterator interface {
-	Error()
-	Next()
-	Value()
+	Error() error
+	Next() bool
+	Value() *CommandLog
 	Close()
 }
 
@@ -264,6 +264,7 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 
 func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) {
 	l.lastCommandLogLock.RLock()
+	defer l.lastCommandLogLock.RUnlock()
 
 	var firstIndex uint64 = firstLevelDBLogIndex + uint64(1)
 	if l.lastCommandLog == nil {
@@ -272,9 +273,7 @@ func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) 
 
 	var lastIndex uint64 = l.lastCommandLog.Index
 
-	l.lastCommandLogLock.RUnlock()
-
-	return l.ReplaySection(firstIndex, lastIndex)
+	return l.replaySectionImpl(firstIndex, lastIndex)
 }
 
 func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uint64) (ILogEntryPersisterIterator, error) {
@@ -295,6 +294,10 @@ func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uin
 		return nil, ErrIncorrectIndexes
 	}
 
+	return l.replaySectionImpl(startIndex, endIndex)
+}
+
+func (l *LevelDBLogEntryPersister) replaySectionImpl(startIndex uint64, endIndex uint64) (ILogEntryPersisterIterator, error) {
 	startIndexBuffer := make([]byte, 8)
 	binary.LittleEndian.PutUint64(startIndexBuffer, startIndex)
 
@@ -309,28 +312,37 @@ func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uin
 }
 
 type LogEntryPersisterIterator struct {
-	iterator iterator.Iterator
-	err      error
+	iterator  iterator.Iterator
+	err       error
+	nextValue *CommandLog
 }
 
 func (i *LogEntryPersisterIterator) Error() error {
-	return i.err
+	if i.err != nil {
+		return i.err
+	}
+
+	return i.iterator.Error()
 }
 
 func (i *LogEntryPersisterIterator) Next() bool {
-	return i.iterator.Next()
-}
-
-func (i *LogEntryPersisterIterator) Value() (*CommandLog, error) {
-	value := i.iterator.Value()
-	commandLogUnmarshalled := CommandLog{}
-	err := json.Unmarshal(value, &commandLogUnmarshalled)
-	if err != nil {
-		i.iterator.Release()
-		return nil, err
+	if !i.iterator.Next() {
+		return false
 	}
 
-	return &commandLogUnmarshalled, nil
+	value := i.iterator.Value()
+	i.nextValue = &CommandLog{}
+	err := json.Unmarshal(value, i.nextValue)
+	if err != nil {
+		i.err = err
+		return false
+	}
+
+	return true
+}
+
+func (i *LogEntryPersisterIterator) Value() *CommandLog {
+	return i.nextValue
 }
 
 func (i *LogEntryPersisterIterator) Close() {

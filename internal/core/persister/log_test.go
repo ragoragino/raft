@@ -60,8 +60,7 @@ func TestFileEntryLoggerWithoutRestarts(t *testing.T) {
 
 		i := 0
 		for iterator.Next() {
-			log, err := iterator.Value()
-			assert.NoError(t, err)
+			log := iterator.Value()
 
 			assert.Equal(t, log.Command, entries[i].Command)
 			i++
@@ -78,17 +77,16 @@ func TestFileEntryLoggerWithoutRestarts(t *testing.T) {
 		iterator, err := fileEntryLogger.ReplaySection(startIndex, endIndex)
 		assert.NoError(t, err)
 
-		i := startIndex
+		i := startIndex - 1
 		for iterator.Next() {
-			log, err := iterator.Value()
-			assert.NoError(t, err)
+			log := iterator.Value()
 
-			assert.Equal(t, log.Command, entries[i-1].Command)
+			assert.Equal(t, log.Command, entries[i].Command)
 			i++
 		}
 
 		assert.NoError(t, iterator.Error())
-		assert.Equal(t, endIndex, i-1)
+		assert.Equal(t, endIndex, i)
 	})
 
 	t.Run("Delete&Get", func(t *testing.T) {
@@ -180,8 +178,7 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 
 		i := 0
 		for iterator.Next() {
-			log, err := iterator.Value()
-			assert.NoError(t, err)
+			log := iterator.Value()
 
 			assert.Equal(t, log.Command, entries[i].Command)
 			i++
@@ -198,17 +195,16 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 		iterator, err := fileEntryLogger.ReplaySection(startIndex, endIndex)
 		assert.NoError(t, err)
 
-		i := startIndex
+		i := startIndex - 1
 		for iterator.Next() {
-			log, err := iterator.Value()
-			assert.NoError(t, err)
+			log := iterator.Value()
 
-			assert.Equal(t, log.Command, entries[i-1].Command)
+			assert.Equal(t, log.Command, entries[i].Command)
 			i++
 		}
 
 		assert.NoError(t, iterator.Error())
-		assert.Equal(t, endIndex, i-1)
+		assert.Equal(t, endIndex, i)
 	})
 
 	fileEntryLogger.Close()
