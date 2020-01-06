@@ -7,6 +7,7 @@ import (
 	logrus "github.com/sirupsen/logrus"
 	"github.com/syndtr/goleveldb/leveldb"
 	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/util"
 	"sync"
 )
@@ -26,6 +27,8 @@ var (
 	ErrIndexedLogDoesNotExists = errors.New("Log with given index does not exist.")
 
 	ErrDatabaseEmpty = errors.New("Database is empty")
+
+	ErrIncorrectIndexes = errors.New("Indexes passed are incorrect")
 )
 
 type CommandLog struct {
@@ -44,7 +47,17 @@ type ILogEntryPersister interface {
 	GetLastLog() *CommandLog
 	FindLogByIndex(index uint64) (*CommandLog, error)
 	DeleteLogsAferIndex(index uint64) error
-	Replay(doneChannel <-chan struct{}, writeChannel chan<- CommandLog) error
+	Replay() (ILogEntryPersisterIterator, error)
+
+	// replay does [from,to] iteration
+	ReplaySection(from uint64, to uint64) (ILogEntryPersisterIterator, error)
+	Close()
+}
+
+type ILogEntryPersisterIterator interface {
+	Error()
+	Next()
+	Value()
 	Close()
 }
 
@@ -249,49 +262,77 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	return nil
 }
 
-func (l *LevelDBLogEntryPersister) Replay(doneChannel <-chan struct{}, writeChannel chan<- CommandLog) error {
+func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) {
+	l.lastCommandLogLock.RLock()
+
+	var firstIndex uint64 = firstLevelDBLogIndex + uint64(1)
+	if l.lastCommandLog == nil {
+		return nil, ErrIndexedLogDoesNotExists
+	}
+
+	var lastIndex uint64 = l.lastCommandLog.Index
+
+	l.lastCommandLogLock.RUnlock()
+
+	return l.ReplaySection(firstIndex, lastIndex)
+}
+
+func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uint64) (ILogEntryPersisterIterator, error) {
 	l.lastCommandLogLock.RLock()
 	defer l.lastCommandLogLock.RUnlock()
 
-	var firstIndex uint64 = firstLevelDBLogIndex + uint64(1)
-	var lastIndex uint64 = firstLevelDBLogIndex + uint64(1)
 	if l.lastCommandLog == nil {
-		return ErrIndexedLogDoesNotExists
+		return nil, ErrIndexedLogDoesNotExists
 	}
 
-	lastIndex = l.lastCommandLog.Index
+	var lastIndex uint64 = l.lastCommandLog.Index
 
-	firstIndexBuffer := make([]byte, 8)
-	binary.LittleEndian.PutUint64(firstIndexBuffer, firstIndex)
+	if startIndex > endIndex {
+		return nil, ErrIncorrectIndexes
+	} else if startIndex <= firstLevelDBLogIndex {
+		return nil, ErrIncorrectIndexes
+	} else if endIndex > lastIndex {
+		return nil, ErrIncorrectIndexes
+	}
+
+	startIndexBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(startIndexBuffer, startIndex)
 
 	// End must be adjusted by one due to open range iteration, e.g. [0, 10)
-	lastIndexBuffer := make([]byte, 8)
-	binary.LittleEndian.PutUint64(lastIndexBuffer, lastIndex+1)
+	endIndexBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(endIndexBuffer, endIndex+1)
 
-	iter := l.db.NewIterator(&util.Range{Start: firstIndexBuffer, Limit: lastIndexBuffer}, nil)
-processLoop:
-	for {
-		select {
-		case <-doneChannel:
-			iter.Release()
-			return nil
-		default:
-			if !iter.Next() {
-				break processLoop
-			}
+	iter := l.db.NewIterator(&util.Range{Start: startIndexBuffer, Limit: endIndexBuffer}, nil)
+	return &LogEntryPersisterIterator{
+		iterator: iter,
+	}, nil
+}
 
-			value := iter.Value()
-			commandLogUnmarshalled := CommandLog{}
-			err := json.Unmarshal(value, &commandLogUnmarshalled)
-			if err != nil {
-				iter.Release()
-				return err
-			}
+type LogEntryPersisterIterator struct {
+	iterator iterator.Iterator
+	err      error
+}
 
-			writeChannel <- commandLogUnmarshalled
-		}
+func (i *LogEntryPersisterIterator) Error() error {
+	return i.err
+}
+
+func (i *LogEntryPersisterIterator) Next() bool {
+	return i.iterator.Next()
+}
+
+func (i *LogEntryPersisterIterator) Value() (*CommandLog, error) {
+	value := i.iterator.Value()
+	commandLogUnmarshalled := CommandLog{}
+	err := json.Unmarshal(value, &commandLogUnmarshalled)
+	if err != nil {
+		i.iterator.Release()
+		return nil, err
 	}
 
-	iter.Release()
-	return iter.Error()
+	return &commandLogUnmarshalled, nil
+}
+
+func (i *LogEntryPersisterIterator) Close() {
+	i.iterator.Release()
 }

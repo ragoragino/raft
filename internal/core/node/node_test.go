@@ -25,7 +25,7 @@ import (
 )
 
 var (
-	startingStateInfo = StateInfo{
+	startingStateInfo = PersistentStateInfo{
 		CurrentTerm: 0,
 		VotedFor:    nil,
 		Role:        FOLLOWER,
@@ -754,17 +754,14 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 	// Wait for the replication of documents
 	time.Sleep(10 * time.Second)
 
-	// TODO: Get documents from the previously failed node's state machine
+	// Get documents from the previously failed node's state machine
 	failedNode, ok := rafts[nonLeaderNode]
 	assert.True(t, ok)
 
-	for i := 0; i != nOfTotalRequests; i++ {
-		entry, err := failedNode.logManager.FindEntryAtIndex(uint64(i + startingLogIndex))
-		assert.NoError(t, err)
-
-		request, ok := clientCreateRequests[entry.Key]
+	for key, value := range clientCreateRequests {
+		stateMachineValue, ok := failedNode.stateMachine.Get(key)
 		assert.True(t, ok)
-		assert.Equal(t, entry.Payload, request.Value)
+		assert.Equal(t, value.Value, stateMachineValue)
 	}
 
 	// Close HTTP and cluster servers, Raft instances and cluster clients down

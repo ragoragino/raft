@@ -1,9 +1,11 @@
 package node
 
 import (
-	"github.com/golang/protobuf/proto"
+	"fmt"
 	pb "raft/internal/core/node/gen"
 	"raft/internal/core/persister"
+
+	"github.com/golang/protobuf/proto"
 )
 
 type ILogEntryManager interface {
@@ -11,6 +13,7 @@ type ILogEntryManager interface {
 	GetLastLogTerm() uint64
 	FindTermAtIndex(index uint64) (uint64, error)
 	FindEntryAtIndex(index uint64) (*pb.AppendEntriesRequest_Entry, error)
+	GetEntriesBetweenIndexes(startIndex uint64, endIndex uint64) ([]*pb.AppendEntriesRequest_Entry, error)
 	DeleteLogsAferIndex(index uint64) error
 	// TODO: Maybe change the type to some neutral type
 	AppendEntries(entries []*pb.AppendEntriesRequest_Entry) error
@@ -88,4 +91,37 @@ func (l *LogEntryManager) AppendEntries(entries []*pb.AppendEntriesRequest_Entry
 	}
 
 	return l.entryPersister.AppendLogs(persisterEntries)
+}
+
+func (l *LogEntryManager) GetEntriesBetweenIndexes(startIndex uint64, endIndex uint64) ([]*pb.AppendEntriesRequest_Entry, error) {
+	if endIndex <= startIndex {
+		return nil, fmt.Errorf("end index %d is not lower than the starting index %d", endIndex, startIndex)
+	}
+
+	entries := make([]*pb.AppendEntriesRequest_Entry, 0, endIndex-startIndex)
+
+	iterator, err := l.entryPersister.ReplaySection(startIndex+1, endIndex)
+	if err != nil {
+		return nil, err
+	}
+
+	for iterator.Next() {
+		log, err := iterator.Value()
+		if err != nil {
+			iterator.Close()
+			return nil, err
+		}
+
+		entry := &pb.AppendEntriesRequest_Entry{}
+		err = proto.Unmarshal(log.Command, entry)
+		if err != nil {
+			iterator.Close()
+			return nil, err
+		}
+
+		entries = append(entries, entry)
+	}
+
+	iterator.Close()
+	return entries, iterator.Error()
 }

@@ -55,23 +55,40 @@ func TestFileEntryLoggerWithoutRestarts(t *testing.T) {
 	})
 
 	t.Run("Replay", func(t *testing.T) {
-		doneChannel := make(chan struct{})
-		writeChannel := make(chan CommandLog)
-
-		go func() {
-			err := fileEntryLogger.Replay(doneChannel, writeChannel)
-			assert.NoError(t, err)
-
-			close(writeChannel)
-		}()
+		iterator, err := fileEntryLogger.Replay()
+		assert.NoError(t, err)
 
 		i := 0
-		for log := range writeChannel {
+		for iterator.Next() {
+			log, err := iterator.Value()
+			assert.NoError(t, err)
+
 			assert.Equal(t, log.Command, entries[i].Command)
 			i++
 		}
 
+		assert.NoError(t, iterator.Error())
 		assert.Equal(t, len(entries), i)
+	})
+
+	t.Run("ReplaySection", func(t *testing.T) {
+		var startIndex uint64 = 2
+		var endIndex uint64 = 4
+
+		iterator, err := fileEntryLogger.ReplaySection(startIndex, endIndex)
+		assert.NoError(t, err)
+
+		i := startIndex
+		for iterator.Next() {
+			log, err := iterator.Value()
+			assert.NoError(t, err)
+
+			assert.Equal(t, log.Command, entries[i-1].Command)
+			i++
+		}
+
+		assert.NoError(t, iterator.Error())
+		assert.Equal(t, endIndex, i-1)
 	})
 
 	t.Run("Delete&Get", func(t *testing.T) {
@@ -158,23 +175,40 @@ func TestFileEntryLoggerWithRestarts(t *testing.T) {
 	})
 
 	t.Run("Replay", func(t *testing.T) {
-		doneChannel := make(chan struct{})
-		writeChannel := make(chan CommandLog)
-
-		go func() {
-			err := fileEntryLogger.Replay(doneChannel, writeChannel)
-			assert.NoError(t, err)
-
-			close(writeChannel)
-		}()
+		iterator, err := fileEntryLogger.Replay()
+		assert.NoError(t, err)
 
 		i := 0
-		for log := range writeChannel {
+		for iterator.Next() {
+			log, err := iterator.Value()
+			assert.NoError(t, err)
+
 			assert.Equal(t, log.Command, entries[i].Command)
 			i++
 		}
 
+		assert.NoError(t, iterator.Error())
 		assert.Equal(t, len(entries)-int(indexToDeleteLogsAfter), i)
+	})
+
+	t.Run("ReplaySection", func(t *testing.T) {
+		var startIndex uint64 = 1
+		var endIndex uint64 = 2
+
+		iterator, err := fileEntryLogger.ReplaySection(startIndex, endIndex)
+		assert.NoError(t, err)
+
+		i := startIndex
+		for iterator.Next() {
+			log, err := iterator.Value()
+			assert.NoError(t, err)
+
+			assert.Equal(t, log.Command, entries[i-1].Command)
+			i++
+		}
+
+		assert.NoError(t, iterator.Error())
+		assert.Equal(t, endIndex, i-1)
 	})
 
 	fileEntryLogger.Close()
