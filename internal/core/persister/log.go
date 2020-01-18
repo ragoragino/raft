@@ -4,12 +4,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"sync"
+
 	logrus "github.com/sirupsen/logrus"
 	"github.com/syndtr/goleveldb/leveldb"
 	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
-	"sync"
 )
 
 const (
@@ -61,6 +63,27 @@ type ILogEntryPersisterIterator interface {
 	Close()
 }
 
+type numberComparer struct{}
+
+func (numberComparer) Name() string {
+	return "NumberComparer"
+}
+
+func (p numberComparer) Compare(first, second []byte) int {
+	fistNum := binary.LittleEndian.Uint64(first)
+	secondNum := binary.LittleEndian.Uint64(second)
+	if fistNum < secondNum {
+		return -1
+	} else if fistNum > secondNum {
+		return 1
+	}
+
+	return 0
+}
+
+func (numberComparer) Separator(dst, a, b []byte) []byte { return nil }
+func (numberComparer) Successor(dst, b []byte) []byte    { return nil }
+
 // LevelDBLogEntryPersister is safe for concurrent usage
 type LevelDBLogEntryPersister struct {
 	// leveldb.DB is safe for concurrent usage
@@ -71,7 +94,9 @@ type LevelDBLogEntryPersister struct {
 }
 
 func NewLevelDBLogEntryPersister(logger *logrus.Entry, filePath string) *LevelDBLogEntryPersister {
-	db, err := leveldb.OpenFile(filePath, nil)
+	db, err := leveldb.OpenFile(filePath, &opt.Options{
+		Comparer: &numberComparer{},
+	})
 	if leveldb_errors.IsCorrupted(err) {
 		db, err = leveldb.RecoverFile(filePath, nil)
 		if err != nil {
@@ -262,6 +287,7 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	return nil
 }
 
+// TODO: Is holding locks necessary due to the possibility of concurrent DeleteLogsAferIndex?
 func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) {
 	l.lastCommandLogLock.RLock()
 	defer l.lastCommandLogLock.RUnlock()
@@ -276,6 +302,7 @@ func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) 
 	return l.replaySectionImpl(firstIndex, lastIndex)
 }
 
+// TODO: Is holding locks necessary due to the possibility of concurrent DeleteLogsAferIndex?
 func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uint64) (ILogEntryPersisterIterator, error) {
 	l.lastCommandLogLock.RLock()
 	defer l.lastCommandLogLock.RUnlock()

@@ -13,7 +13,11 @@ type ILogEntryManager interface {
 	GetLastLogTerm() uint64
 	FindTermAtIndex(index uint64) (uint64, error)
 	FindEntryAtIndex(index uint64) (*pb.AppendEntriesRequest_Entry, error)
+
+	// GetEntriesBetweenIndexes gets all objects in the range (startIndex, endIndex]
 	GetEntriesBetweenIndexes(startIndex uint64, endIndex uint64) ([]*pb.AppendEntriesRequest_Entry, error)
+
+	// DeleteLogsAferIndex deletes all entries after given index (including also the index)
 	DeleteLogsAferIndex(index uint64) error
 	// TODO: Maybe change the type to some neutral type
 	AppendEntries(entries []*pb.AppendEntriesRequest_Entry) error

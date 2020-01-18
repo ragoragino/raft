@@ -452,22 +452,9 @@ func (r *Raft) broadcastRequestVote(ctx context.Context) {
 
 	// Check if majority reached
 	if r.checkClusterMajority(countOfVotes) {
-		// Check if there isn't a discrepancy between our local committed index and the index
-		// with which we have been elected. If so, apply the missing entries to the state machine
-		lastCommittedIndex := r.stateManager.GetCommitIndex()
-		if lastCommittedIndex < lastLogIndex {
-			logEntriesToCommit, err := r.logManager.GetEntriesBetweenIndexes(lastCommittedIndex, lastLogIndex)
-			if err != nil {
-				r.logger.Panicf("unable to find entry at indexes %d:%d: %+v", lastCommittedIndex, lastLogIndex, err)
-			}
-
-			for _, logEntryToCommit := range logEntriesToCommit {
-				r.logger.Debugf("applying log entry %+v to state machine", logEntryToCommit)
-				r.stateMachine.Create(logEntryToCommit.GetKey(), logEntryToCommit.GetPayload())
-			}
-		}
-
+		r.commitLogsToStateMachine(ctx, r.stateManager.GetCommitIndex(), lastLogIndex)
 		r.stateManager.SetCommitIndex(lastLogIndex)
+
 		r.stateManager.SwitchPersistentState(r.stateManager.GetCurrentTerm(), nil, LEADER)
 	}
 }
@@ -617,10 +604,9 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				receiverTerm := r.stateManager.GetCurrentTerm()
 				entries := request.GetEntries()
 				previousLogIndex := request.GetPrevLogIndex()
+				previousLogTerm := request.GetPrevLogTerm()
 				leaderID := request.GetLeaderId()
 				leaderCommit := request.GetLeaderCommit()
-
-				lastCommittedIndex := r.stateManager.GetCommitIndex()
 
 				responseFunc := func(sentByLeader bool, entriesAppended bool) {
 					r.appendEntriesHandlersChannel <- appendEntriesEvent{
@@ -664,6 +650,8 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 					logger.Panicf("received request with a previous index %d lower than the lower limit for log indexes",
 						previousLogIndex)
 				} else if previousLogIndex >= startingLogIndex {
+					// If log does not contain an term-matching entry at previousLogIndex
+					// reply false
 					term, err := r.logManager.FindTermAtIndex(previousLogIndex)
 					if err == persister.ErrIndexedLogDoesNotExists {
 						r.stateMutex.Unlock()
@@ -675,11 +663,41 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 						logger.Panicf("failed when finding log by index %d: %+v", previousLogIndex, err)
 					}
 
-					if term != request.GetPrevLogTerm() {
-						err := r.logManager.DeleteLogsAferIndex(previousLogIndex)
-						if err != nil {
+					if term != previousLogTerm {
+						r.stateMutex.Unlock()
+						logger.Debugf("terms not equal (local: %d, remote: %d) at index: %d", term, previousLogTerm, previousLogIndex)
+						responseFunc(true, false)
+						continue
+					}
+
+					// If an existing entry conflicts with a new one, i.e. same index
+					// but different terms, delete the existing entry and all that follow it
+					// Otherwise, append only new entries
+					if len(entries) != 0 {
+						firstNewLogIndex := previousLogIndex + 1
+						firstNewLogTerm, err := r.logManager.FindTermAtIndex(firstNewLogIndex)
+						if err != nil && err != persister.ErrIndexedLogDoesNotExists {
 							r.stateMutex.Unlock()
-							logger.Panicf("unable to delete log after index %d: %+v", previousLogIndex, err)
+							logger.Panicf("failed when finding log by index %d: %+v", firstNewLogIndex, err)
+						} else if err == nil {
+							if entries[0].GetTerm() != firstNewLogTerm {
+								err := r.logManager.DeleteLogsAferIndex(firstNewLogIndex)
+								if err != nil {
+									r.stateMutex.Unlock()
+									logger.Panicf("unable to delete log after index %d: %+v", previousLogIndex, err)
+								}
+							} else {
+								// We presuppose that any logs after the first new log are equal
+								lastLogIndex := r.logManager.GetLastLogIndex()
+								newLogIndex := previousLogIndex + uint64(len(entries))
+								nOfLogToAppend := newLogIndex - lastLogIndex
+								if nOfLogToAppend < 0 {
+									nOfLogToAppend = 0
+								}
+
+								indexToAppendFrom := uint64(len(entries)) - nOfLogToAppend
+								entries = entries[indexToAppendFrom:]
+							}
 						}
 					}
 				} else if len(entries) != 0 {
@@ -693,7 +711,7 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				}
 
 				if len(entries) != 0 {
-					logger.Debugf("appending entries")
+					logger.Debugf("appending entries: %+v", entries)
 					err := r.logManager.AppendEntries(entries)
 					if err != nil {
 						r.stateMutex.Unlock()
@@ -701,25 +719,10 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 					}
 				}
 
-				// Commit the last commited log from the leader only if it differs from
-				// the local one
 				// Leader should always have his commitIndex lower than the
 				// last entry that is being sent
-				if leaderCommit > lastCommittedIndex {
-					r.stateManager.SetCommitIndex(leaderCommit)
-
-					// Update the key in the state machine
-					logEntriesToCommit, err := r.logManager.GetEntriesBetweenIndexes(lastCommittedIndex, leaderCommit)
-					if err != nil {
-						r.stateMutex.Unlock()
-						logger.Panicf("unable to find entry at indexes %d:%d: %+v", lastCommittedIndex, leaderCommit, err)
-					}
-
-					for _, logEntryToCommit := range logEntriesToCommit {
-						logger.Debugf("applying log entry %+v to state machine", logEntryToCommit)
-						r.stateMachine.Create(logEntryToCommit.GetKey(), logEntryToCommit.GetPayload())
-					}
-				}
+				r.commitLogsToStateMachine(appendEntryToProcess.Context, r.stateManager.GetCommitIndex(), leaderCommit)
+				r.stateManager.SetCommitIndex(leaderCommit)
 
 				r.stateMutex.Unlock()
 
@@ -976,6 +979,8 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 	go func() {
 		defer close(majorityReachedChannel)
 
+		ctxWithRequestID := createNewRequestContext()
+
 		sendMajorityReachedOnce := sync.Once{}
 		sendMajorityReachedResponse := func(count int) {
 			if r.checkClusterMajority(count) {
@@ -989,18 +994,16 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 
 					// Update the index of the last commited log
 					r.stateMutex.Lock()
-					r.stateManager.SetCommitIndex(previousLogIndex)
+					nextLogIndex := previousLogIndex + uint64(len(newEntries))
+					r.commitLogsToStateMachine(ctxWithRequestID, r.stateManager.GetCommitIndex(), nextLogIndex)
+					r.stateManager.SetCommitIndex(nextLogIndex)
 					r.stateMutex.Unlock()
-
-					// Update the key in the state machine
-					r.stateMachine.Create(request.Key, request.Value)
 				})
 			}
 		}
 
 		logger.Printf("sending AppendEntries request: %+v", clusterRequest)
 
-		ctxWithRequestID := createNewRequestContext()
 		requestCtx, cancel := context.WithCancel(ctxWithRequestID)
 		responses := r.cluster.BroadcastAppendEntriesRPCs(requestCtx, clusterRequest)
 		cancel()
@@ -1232,6 +1235,24 @@ func (r *Raft) checkClusterMajority(count int) bool {
 		return true
 	}
 	return false
+}
+
+// commit logs to state machine in the range (fromIndex, toIndex]
+func (r *Raft) commitLogsToStateMachine(ctx context.Context, fromIndex uint64, toIndex uint64) {
+	logger := loggerFromContext(r.logger, ctx)
+
+	if toIndex > fromIndex {
+		logEntriesToCommit, err := r.logManager.GetEntriesBetweenIndexes(fromIndex, toIndex)
+		if err != nil {
+			logger.Panicf("unable to find entry at indexes %d:%d: %+v", fromIndex, toIndex, err)
+		}
+
+		logger.Debugf("log entries to commit: %+v", logEntriesToCommit)
+
+		for _, logEntryToCommit := range logEntriesToCommit {
+			r.stateMachine.Create(logEntryToCommit.GetKey(), logEntryToCommit.GetPayload())
+		}
+	}
 }
 
 func newElectionTimeout(min time.Duration, max time.Duration) time.Duration {

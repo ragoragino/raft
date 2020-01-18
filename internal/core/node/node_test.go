@@ -32,10 +32,8 @@ var (
 	}
 )
 
-func initializeStatePersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (persister.IStateLogger, func()) {
-	fileStatePersister := persister.NewLevelDBStateLogger(logger.WithFields(logrus.Fields{
-		"name": "LevelDBStatePersister",
-	}), fileStatePath)
+func initializeStatePersister(t *testing.T, logger *logrus.Entry, fileStatePath string) (persister.IStateLogger, func()) {
+	fileStatePersister := persister.NewLevelDBStateLogger(logger, fileStatePath)
 
 	os.RemoveAll(fileStatePath)
 
@@ -46,10 +44,8 @@ func initializeStatePersister(t *testing.T, logger *logrus.Logger, fileStatePath
 	}
 }
 
-func initializeLogEntryPersister(t *testing.T, logger *logrus.Logger, fileStatePath string) (persister.ILogEntryPersister, func()) {
-	fileLogEntryPersister := persister.NewLevelDBLogEntryPersister(logger.WithFields(logrus.Fields{
-		"name": "LevelDBLogPersister",
-	}), fileStatePath)
+func initializeLogEntryPersister(t *testing.T, logger *logrus.Entry, fileStatePath string) (persister.ILogEntryPersister, func()) {
+	fileLogEntryPersister := persister.NewLevelDBLogEntryPersister(logger, fileStatePath)
 
 	os.RemoveAll(fileStatePath)
 
@@ -103,14 +99,24 @@ func constructClusterComponents(t *testing.T,
 			"node":      name,
 		})
 
+		statePersisterLogger := logger.WithFields(logrus.Fields{
+			"component": "LevelDBStatePersister",
+			"node":      name,
+		})
+
 		fileStatePath := fmt.Sprintf("db_node_test_%s_State_%s.txt", t.Name(), name)
 		fileStateLogger, fileStateLoggerClean :=
-			initializeStatePersister(t, logger, fileStatePath)
+			initializeStatePersister(t, statePersisterLogger, fileStatePath)
 		cleanerFuncs = append(cleanerFuncs, fileStateLoggerClean)
+
+		logEntryPersisterLogger := logger.WithFields(logrus.Fields{
+			"component": "LevelDBLogPersister",
+			"node":      name,
+		})
 
 		fileLogPath := fmt.Sprintf("db_node_test_%s_Log_%s.txt", t.Name(), name)
 		fileLogLogger, fileLogLoggerClean :=
-			initializeLogEntryPersister(t, logger, fileLogPath)
+			initializeLogEntryPersister(t, logEntryPersisterLogger, fileLogPath)
 		cleanerFuncs = append(cleanerFuncs, fileLogLoggerClean)
 
 		stateHandler := NewStateManager(startingStateInfo, fileStateLogger)
