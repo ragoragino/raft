@@ -276,11 +276,11 @@ func (r *Raft) observeStateChanges(doneChannel <-chan struct{}, currentRole Raft
 	roleChangedChannel := make(chan RaftRole)
 
 	stateChangedChannel := make(chan StateSwitched)
-	id := r.stateManager.AddStateObserver(stateChangedChannel)
+	id := r.stateManager.AddPersistentStateObserver(stateChangedChannel)
 
 	go func() {
 		defer func() {
-			r.stateManager.RemoveStateObserver(id)
+			r.stateManager.RemovePersistentStateObserver(id)
 			close(stateChangedChannel)
 			close(roleChangedChannel)
 			close(finishChannel)
@@ -330,7 +330,7 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 
 				newTerm := r.stateManager.GetCurrentTerm() + 1
 				votedFor := r.settings.ID
-				r.stateManager.SwitchState(newTerm, &votedFor, CANDIDATE)
+				r.stateManager.SwitchPersistentState(newTerm, &votedFor, CANDIDATE)
 
 				r.stateMutex.Unlock()
 			}
@@ -415,10 +415,11 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
 
 func (r *Raft) broadcastRequestVote(ctx context.Context) {
 	r.stateMutex.RLock()
+	lastLogIndex := r.logManager.GetLastLogIndex()
 	request := &pb.RequestVoteRequest{
 		Term:         r.stateManager.GetCurrentTerm(),
 		CandidateId:  r.settings.ID,
-		LastLogIndex: r.logManager.GetLastLogIndex(),
+		LastLogIndex: lastLogIndex,
 		LastLogTerm:  r.logManager.GetLastLogTerm(),
 	}
 	r.stateMutex.RUnlock()
@@ -440,7 +441,7 @@ func (r *Raft) broadcastRequestVote(ctx context.Context) {
 	for _, response := range responses {
 		// If the response contains higher term, we convert to follower
 		if response.GetTerm() > r.stateManager.GetCurrentTerm() {
-			r.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
+			r.stateManager.SwitchPersistentState(response.GetTerm(), nil, FOLLOWER)
 			return
 		}
 
@@ -451,7 +452,10 @@ func (r *Raft) broadcastRequestVote(ctx context.Context) {
 
 	// Check if majority reached
 	if r.checkClusterMajority(countOfVotes) {
-		r.stateManager.SwitchState(r.stateManager.GetCurrentTerm(), nil, LEADER)
+		r.commitLogsToStateMachine(ctx, r.stateManager.GetCommitIndex(), lastLogIndex)
+		r.stateManager.SetCommitIndex(lastLogIndex)
+
+		r.stateManager.SwitchPersistentState(r.stateManager.GetCurrentTerm(), nil, LEADER)
 	}
 }
 
@@ -505,7 +509,7 @@ func (r *Raft) broadcastHeartbeat(done <-chan struct{}) <-chan struct{} {
 				LeaderId:     r.settings.ID,
 				PrevLogIndex: r.logManager.GetLastLogIndex(),
 				PrevLogTerm:  r.logManager.GetLastLogTerm(),
-				LeaderCommit: 0, // TODO
+				LeaderCommit: r.stateManager.GetCommitIndex(),
 				Entries:      make([]*pb.AppendEntriesRequest_Entry, 0),
 			}
 			r.stateMutex.RUnlock()
@@ -529,13 +533,13 @@ func (r *Raft) broadcastHeartbeat(done <-chan struct{}) <-chan struct{} {
 				// in which case we have to convert to FOLLOWER state
 				if responseWrapper.Error == nil && responseWrapper.Response.GetTerm() > currentTerm {
 					r.stateMutex.Lock()
-					r.stateManager.SwitchState(responseWrapper.Response.GetTerm(), nil, FOLLOWER)
+					r.stateManager.SwitchPersistentState(responseWrapper.Response.GetTerm(), nil, FOLLOWER)
 					r.stateMutex.Unlock()
 					return
 				}
 
 				// Retry the heartbeat if unsuccessful or gRPC errors occured
-				if responseWrapper.Error != nil || !responseWrapper.Response.GetSuccess() {
+				if !responseWrapper.Response.GetSuccess() {
 					r.logger.Errorf("unable to broadcast heartbeat: %+v", responseWrapper)
 					retryChannel, ok := r.retryNodeHeartbeatChannels[responseWrapper.NodeID]
 					if !ok {
@@ -600,7 +604,9 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				receiverTerm := r.stateManager.GetCurrentTerm()
 				entries := request.GetEntries()
 				previousLogIndex := request.GetPrevLogIndex()
+				previousLogTerm := request.GetPrevLogTerm()
 				leaderID := request.GetLeaderId()
+				leaderCommit := request.GetLeaderCommit()
 
 				responseFunc := func(sentByLeader bool, entriesAppended bool) {
 					r.appendEntriesHandlersChannel <- appendEntriesEvent{
@@ -619,7 +625,7 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				if senderTerm > receiverTerm {
 					// The sender node has higher term than the receiver node, so we switch to FOLLOWER
 					logger.Debugf("switching state to follower. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
-					r.stateManager.SwitchState(senderTerm, nil, FOLLOWER)
+					r.stateManager.SwitchPersistentState(senderTerm, nil, FOLLOWER)
 				} else if senderTerm < receiverTerm {
 					// The candidate has lower term than the node, so deny the request
 					logger.Debugf("sending reject response. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
@@ -628,7 +634,7 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 					continue
 				} else if r.stateManager.GetRole() == CANDIDATE {
 					logger.Debugf("switching state to follower because received request with an equal term from a leader")
-					r.stateManager.SwitchState(senderTerm, nil, FOLLOWER)
+					r.stateManager.SwitchPersistentState(senderTerm, nil, FOLLOWER)
 				}
 
 				// Set the leader
@@ -644,6 +650,8 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 					logger.Panicf("received request with a previous index %d lower than the lower limit for log indexes",
 						previousLogIndex)
 				} else if previousLogIndex >= startingLogIndex {
+					// If log does not contain an term-matching entry at previousLogIndex
+					// reply false
 					term, err := r.logManager.FindTermAtIndex(previousLogIndex)
 					if err == persister.ErrIndexedLogDoesNotExists {
 						r.stateMutex.Unlock()
@@ -655,11 +663,41 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 						logger.Panicf("failed when finding log by index %d: %+v", previousLogIndex, err)
 					}
 
-					if term != request.GetPrevLogTerm() {
-						err := r.logManager.DeleteLogsAferIndex(previousLogIndex)
-						if err != nil {
+					if term != previousLogTerm {
+						r.stateMutex.Unlock()
+						logger.Debugf("terms not equal (local: %d, remote: %d) at index: %d", term, previousLogTerm, previousLogIndex)
+						responseFunc(true, false)
+						continue
+					}
+
+					// If an existing entry conflicts with a new one, i.e. same index
+					// but different terms, delete the existing entry and all that follow it
+					// Otherwise, append only new entries
+					if len(entries) != 0 {
+						firstNewLogIndex := previousLogIndex + 1
+						firstNewLogTerm, err := r.logManager.FindTermAtIndex(firstNewLogIndex)
+						if err != nil && err != persister.ErrIndexedLogDoesNotExists {
 							r.stateMutex.Unlock()
-							logger.Panicf("unable to delete log after index %d: %+v", previousLogIndex, err)
+							logger.Panicf("failed when finding log by index %d: %+v", firstNewLogIndex, err)
+						} else if err == nil {
+							if entries[0].GetTerm() != firstNewLogTerm {
+								err := r.logManager.DeleteLogsAferIndex(firstNewLogIndex)
+								if err != nil {
+									r.stateMutex.Unlock()
+									logger.Panicf("unable to delete log after index %d: %+v", previousLogIndex, err)
+								}
+							} else {
+								// We presuppose that any logs after the first new log are equal
+								lastLogIndex := r.logManager.GetLastLogIndex()
+								newLogIndex := previousLogIndex + uint64(len(entries))
+								nOfLogToAppend := newLogIndex - lastLogIndex
+								if nOfLogToAppend < 0 {
+									nOfLogToAppend = 0
+								}
+
+								indexToAppendFrom := uint64(len(entries)) - nOfLogToAppend
+								entries = entries[indexToAppendFrom:]
+							}
 						}
 					}
 				} else if len(entries) != 0 {
@@ -673,13 +711,18 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				}
 
 				if len(entries) != 0 {
-					logger.Debugf("appending entries")
+					logger.Debugf("appending entries: %+v", entries)
 					err := r.logManager.AppendEntries(entries)
 					if err != nil {
 						r.stateMutex.Unlock()
 						logger.Panicf("unable to append logs: %+v", err)
 					}
 				}
+
+				// Leader should always have his commitIndex lower than the
+				// last entry that is being sent
+				r.commitLogsToStateMachine(appendEntryToProcess.Context, r.stateManager.GetCommitIndex(), leaderCommit)
+				r.stateManager.SetCommitIndex(leaderCommit)
 
 				r.stateMutex.Unlock()
 
@@ -742,7 +785,7 @@ func (r *Raft) processRequestVote(done <-chan struct{}) <-chan struct{} {
 				if senderTerm > receiverTerm {
 					// Sender node has higher term than receiver node, so we switch to FOLLOWER
 					logger.Debugf("switching state to follower. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
-					r.stateManager.SwitchState(senderTerm, nil, FOLLOWER)
+					r.stateManager.SwitchPersistentState(senderTerm, nil, FOLLOWER)
 				} else if senderTerm < receiverTerm {
 					// The candidate has lower term than the node, so deny the request
 					logger.Debugf("sending reject response. sender's term: %d, receiver's term: %d", senderTerm, receiverTerm)
@@ -787,7 +830,7 @@ func (r *Raft) processRequestVote(done <-chan struct{}) <-chan struct{} {
 
 				logger.Debugf("voting for sender")
 
-				r.stateManager.SwitchState(senderTerm, &candidateID, FOLLOWER)
+				r.stateManager.SwitchPersistentState(senderTerm, &candidateID, FOLLOWER)
 
 				r.stateMutex.Unlock()
 				responseFunc(true)
@@ -904,6 +947,7 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 	previousLogIndex := r.logManager.GetLastLogIndex()
 	previousLogTerm := r.logManager.GetLastLogTerm()
 	currentTerm := r.stateManager.GetCurrentTerm()
+	commitIndex := r.stateManager.GetCommitIndex()
 
 	r.stateMutex.RUnlock()
 
@@ -927,13 +971,15 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 		LeaderId:     r.settings.ID,
 		PrevLogIndex: previousLogIndex,
 		PrevLogTerm:  previousLogTerm,
-		LeaderCommit: 0, // TODO
+		LeaderCommit: commitIndex,
 		Entries:      newEntries,
 	}
 
 	majorityReachedChannel := make(chan external_server.ClusterStatusCode)
 	go func() {
 		defer close(majorityReachedChannel)
+
+		ctxWithRequestID := createNewRequestContext()
 
 		sendMajorityReachedOnce := sync.Once{}
 		sendMajorityReachedResponse := func(count int) {
@@ -946,15 +992,18 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 					default:
 					}
 
-					// Update the key in the state machine
-					r.stateMachine.Create(request.Key, request.Value)
+					// Update the index of the last commited log
+					r.stateMutex.Lock()
+					nextLogIndex := previousLogIndex + uint64(len(newEntries))
+					r.commitLogsToStateMachine(ctxWithRequestID, r.stateManager.GetCommitIndex(), nextLogIndex)
+					r.stateManager.SetCommitIndex(nextLogIndex)
+					r.stateMutex.Unlock()
 				})
 			}
 		}
 
 		logger.Printf("sending AppendEntries request: %+v", clusterRequest)
 
-		ctxWithRequestID := createNewRequestContext()
 		requestCtx, cancel := context.WithCancel(ctxWithRequestID)
 		responses := r.cluster.BroadcastAppendEntriesRPCs(requestCtx, clusterRequest)
 		cancel()
@@ -969,7 +1018,7 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 			// our AppendEntries will have higher term
 			if responseWrapper.Error == nil && responseWrapper.Response.GetTerm() > currentTerm {
 				r.stateMutex.Lock()
-				r.stateManager.SwitchState(responseWrapper.Response.GetTerm(), nil, FOLLOWER)
+				r.stateManager.SwitchPersistentState(responseWrapper.Response.GetTerm(), nil, FOLLOWER)
 				r.stateMutex.Unlock()
 
 				majorityReachedChannel <- external_server.Redirect
@@ -1097,7 +1146,7 @@ func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-cha
 				// are on a higher term, therefore we can throw away this request
 				if response.GetTerm() > currentTerm {
 					r.stateMutex.Lock()
-					r.stateManager.SwitchState(response.GetTerm(), nil, FOLLOWER)
+					r.stateManager.SwitchPersistentState(response.GetTerm(), nil, FOLLOWER)
 					r.stateMutex.Unlock()
 					break requestLoop
 				}
@@ -1122,6 +1171,7 @@ func (r *Raft) moveRequest(ctx context.Context, oldRequest *pb.AppendEntriesRequ
 
 	r.stateMutex.RLock()
 	currentTerm := r.stateManager.GetCurrentTerm()
+	commitIndex := r.stateManager.GetCommitIndex()
 	r.stateMutex.RUnlock()
 
 	var term uint64 = startingTerm
@@ -1149,7 +1199,7 @@ func (r *Raft) moveRequest(ctx context.Context, oldRequest *pb.AppendEntriesRequ
 		LeaderId:     r.settings.ID,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  term,
-		LeaderCommit: 0, // TODO
+		LeaderCommit: commitIndex,
 		Entries:      oldRequest.Entries,
 	}
 }
@@ -1185,6 +1235,24 @@ func (r *Raft) checkClusterMajority(count int) bool {
 		return true
 	}
 	return false
+}
+
+// commit logs to state machine in the range (fromIndex, toIndex]
+func (r *Raft) commitLogsToStateMachine(ctx context.Context, fromIndex uint64, toIndex uint64) {
+	logger := loggerFromContext(r.logger, ctx)
+
+	if toIndex > fromIndex {
+		logEntriesToCommit, err := r.logManager.GetEntriesBetweenIndexes(fromIndex, toIndex)
+		if err != nil {
+			logger.Panicf("unable to find entry at indexes %d:%d: %+v", fromIndex, toIndex, err)
+		}
+
+		logger.Debugf("log entries to commit: %+v", logEntriesToCommit)
+
+		for _, logEntryToCommit := range logEntriesToCommit {
+			r.stateMachine.Create(logEntryToCommit.GetKey(), logEntryToCommit.GetPayload())
+		}
+	}
 }
 
 func newElectionTimeout(min time.Duration, max time.Duration) time.Duration {

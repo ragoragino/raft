@@ -4,11 +4,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"sync"
+
 	logrus "github.com/sirupsen/logrus"
 	"github.com/syndtr/goleveldb/leveldb"
 	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
+	"github.com/syndtr/goleveldb/leveldb/iterator"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
-	"sync"
 )
 
 const (
@@ -26,6 +29,8 @@ var (
 	ErrIndexedLogDoesNotExists = errors.New("Log with given index does not exist.")
 
 	ErrDatabaseEmpty = errors.New("Database is empty")
+
+	ErrIncorrectIndexes = errors.New("Indexes passed are incorrect")
 )
 
 type CommandLog struct {
@@ -44,9 +49,40 @@ type ILogEntryPersister interface {
 	GetLastLog() *CommandLog
 	FindLogByIndex(index uint64) (*CommandLog, error)
 	DeleteLogsAferIndex(index uint64) error
-	Replay(doneChannel <-chan struct{}, writeChannel chan<- CommandLog) error
+	Replay() (ILogEntryPersisterIterator, error)
+
+	// replay does [from,to] iteration
+	ReplaySection(from uint64, to uint64) (ILogEntryPersisterIterator, error)
 	Close()
 }
+
+type ILogEntryPersisterIterator interface {
+	Error() error
+	Next() bool
+	Value() *CommandLog
+	Close()
+}
+
+type numberComparer struct{}
+
+func (numberComparer) Name() string {
+	return "NumberComparer"
+}
+
+func (p numberComparer) Compare(first, second []byte) int {
+	fistNum := binary.LittleEndian.Uint64(first)
+	secondNum := binary.LittleEndian.Uint64(second)
+	if fistNum < secondNum {
+		return -1
+	} else if fistNum > secondNum {
+		return 1
+	}
+
+	return 0
+}
+
+func (numberComparer) Separator(dst, a, b []byte) []byte { return nil }
+func (numberComparer) Successor(dst, b []byte) []byte    { return nil }
 
 // LevelDBLogEntryPersister is safe for concurrent usage
 type LevelDBLogEntryPersister struct {
@@ -58,7 +94,9 @@ type LevelDBLogEntryPersister struct {
 }
 
 func NewLevelDBLogEntryPersister(logger *logrus.Entry, filePath string) *LevelDBLogEntryPersister {
-	db, err := leveldb.OpenFile(filePath, nil)
+	db, err := leveldb.OpenFile(filePath, &opt.Options{
+		Comparer: &numberComparer{},
+	})
 	if leveldb_errors.IsCorrupted(err) {
 		db, err = leveldb.RecoverFile(filePath, nil)
 		if err != nil {
@@ -249,49 +287,91 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	return nil
 }
 
-func (l *LevelDBLogEntryPersister) Replay(doneChannel <-chan struct{}, writeChannel chan<- CommandLog) error {
+// TODO: Is holding locks necessary due to the possibility of concurrent DeleteLogsAferIndex?
+func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) {
 	l.lastCommandLogLock.RLock()
 	defer l.lastCommandLogLock.RUnlock()
 
 	var firstIndex uint64 = firstLevelDBLogIndex + uint64(1)
-	var lastIndex uint64 = firstLevelDBLogIndex + uint64(1)
 	if l.lastCommandLog == nil {
-		return ErrIndexedLogDoesNotExists
+		return nil, ErrIndexedLogDoesNotExists
 	}
 
-	lastIndex = l.lastCommandLog.Index
+	var lastIndex uint64 = l.lastCommandLog.Index
 
-	firstIndexBuffer := make([]byte, 8)
-	binary.LittleEndian.PutUint64(firstIndexBuffer, firstIndex)
+	return l.replaySectionImpl(firstIndex, lastIndex)
+}
+
+// TODO: Is holding locks necessary due to the possibility of concurrent DeleteLogsAferIndex?
+func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uint64) (ILogEntryPersisterIterator, error) {
+	l.lastCommandLogLock.RLock()
+	defer l.lastCommandLogLock.RUnlock()
+
+	if l.lastCommandLog == nil {
+		return nil, ErrIndexedLogDoesNotExists
+	}
+
+	var lastIndex uint64 = l.lastCommandLog.Index
+
+	if startIndex > endIndex {
+		return nil, ErrIncorrectIndexes
+	} else if startIndex <= firstLevelDBLogIndex {
+		return nil, ErrIncorrectIndexes
+	} else if endIndex > lastIndex {
+		return nil, ErrIncorrectIndexes
+	}
+
+	return l.replaySectionImpl(startIndex, endIndex)
+}
+
+func (l *LevelDBLogEntryPersister) replaySectionImpl(startIndex uint64, endIndex uint64) (ILogEntryPersisterIterator, error) {
+	startIndexBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(startIndexBuffer, startIndex)
 
 	// End must be adjusted by one due to open range iteration, e.g. [0, 10)
-	lastIndexBuffer := make([]byte, 8)
-	binary.LittleEndian.PutUint64(lastIndexBuffer, lastIndex+1)
+	endIndexBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(endIndexBuffer, endIndex+1)
 
-	iter := l.db.NewIterator(&util.Range{Start: firstIndexBuffer, Limit: lastIndexBuffer}, nil)
-processLoop:
-	for {
-		select {
-		case <-doneChannel:
-			iter.Release()
-			return nil
-		default:
-			if !iter.Next() {
-				break processLoop
-			}
+	iter := l.db.NewIterator(&util.Range{Start: startIndexBuffer, Limit: endIndexBuffer}, nil)
+	return &LogEntryPersisterIterator{
+		iterator: iter,
+	}, nil
+}
 
-			value := iter.Value()
-			commandLogUnmarshalled := CommandLog{}
-			err := json.Unmarshal(value, &commandLogUnmarshalled)
-			if err != nil {
-				iter.Release()
-				return err
-			}
+type LogEntryPersisterIterator struct {
+	iterator  iterator.Iterator
+	err       error
+	nextValue *CommandLog
+}
 
-			writeChannel <- commandLogUnmarshalled
-		}
+func (i *LogEntryPersisterIterator) Error() error {
+	if i.err != nil {
+		return i.err
 	}
 
-	iter.Release()
-	return iter.Error()
+	return i.iterator.Error()
+}
+
+func (i *LogEntryPersisterIterator) Next() bool {
+	if !i.iterator.Next() {
+		return false
+	}
+
+	value := i.iterator.Value()
+	i.nextValue = &CommandLog{}
+	err := json.Unmarshal(value, i.nextValue)
+	if err != nil {
+		i.err = err
+		return false
+	}
+
+	return true
+}
+
+func (i *LogEntryPersisterIterator) Value() *CommandLog {
+	return i.nextValue
+}
+
+func (i *LogEntryPersisterIterator) Close() {
+	i.iterator.Release()
 }

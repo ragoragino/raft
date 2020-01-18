@@ -6,29 +6,37 @@ import (
 	"raft/internal/core/persister"
 )
 
-type StateInfo struct {
+type PersistentStateInfo struct {
 	CurrentTerm uint64
 	VotedFor    *string
 	Role        RaftRole
 }
 
+type VolatileStateInfo struct {
+	CommitIndex uint64
+}
+
 type StateSwitched struct {
-	oldState StateInfo
-	newState StateInfo
+	oldState PersistentStateInfo
+	newState PersistentStateInfo
 }
 
 type IStateManager interface {
-	AddStateObserver(handler chan StateSwitched) string
-	RemoveStateObserver(id string)
+	AddPersistentStateObserver(handler chan StateSwitched) string
+	RemovePersistentStateObserver(id string)
 
 	GetCurrentTerm() uint64
 	GetVotedFor() *string
 	GetRole() RaftRole
-	SwitchState(term uint64, votedFor *string, role RaftRole)
+	SwitchPersistentState(term uint64, votedFor *string, role RaftRole)
+
+	SetCommitIndex(uint64)
+	GetCommitIndex() uint64
 }
 
 type StateManager struct {
-	info StateInfo
+	persistentInfo PersistentStateInfo
+	volatileInfo   VolatileStateInfo
 
 	statePersister persister.IStateLogger
 
@@ -38,20 +46,20 @@ type StateManager struct {
 // StateManager is not safe for concurrent usage, as it is expected to be used
 // mainly with transaction operations. Therefore, clients using StateManager should
 // implement appropriate locking mechanisms
-func NewStateManager(stateInfo StateInfo, statePersister persister.IStateLogger) *StateManager {
+func NewStateManager(stateInfo PersistentStateInfo, statePersister persister.IStateLogger) *StateManager {
 	statePersister.UpdateState(&persister.State{
 		VotedFor:    stateInfo.VotedFor,
 		CurrentTerm: stateInfo.CurrentTerm,
 	})
 
 	return &StateManager{
-		info:           stateInfo,
+		persistentInfo: stateInfo,
 		statePersister: statePersister,
 		handlers:       make(map[string]chan StateSwitched),
 	}
 }
 
-func (s *StateManager) AddStateObserver(handler chan StateSwitched) string {
+func (s *StateManager) AddPersistentStateObserver(handler chan StateSwitched) string {
 	id, err := uuid.NewUUID()
 	if err != nil {
 		logrus.Panicf("unable to create new uuid: %+v", err)
@@ -64,7 +72,7 @@ func (s *StateManager) AddStateObserver(handler chan StateSwitched) string {
 	return idStr
 }
 
-func (s *StateManager) RemoveStateObserver(id string) {
+func (s *StateManager) RemovePersistentStateObserver(id string) {
 	delete(s.handlers, id)
 }
 
@@ -77,23 +85,31 @@ func (s *StateManager) GetVotedFor() *string {
 }
 
 func (s *StateManager) GetRole() RaftRole {
-	return s.info.Role
+	return s.persistentInfo.Role
 }
 
-func (s *StateManager) SwitchState(term uint64, votedFor *string, role RaftRole) {
-	oldInfo := s.info
+func (s *StateManager) SwitchPersistentState(term uint64, votedFor *string, role RaftRole) {
+	oldInfo := s.persistentInfo
 
 	s.statePersister.UpdateState(&persister.State{
 		VotedFor:    votedFor,
 		CurrentTerm: term,
 	})
 
-	s.info.Role = role
+	s.persistentInfo.Role = role
 
 	for _, handler := range s.handlers {
 		handler <- StateSwitched{
 			oldState: oldInfo,
-			newState: s.info,
+			newState: s.persistentInfo,
 		}
 	}
+}
+
+func (s *StateManager) SetCommitIndex(commitIndex uint64) {
+	s.volatileInfo.CommitIndex = commitIndex
+}
+
+func (s *StateManager) GetCommitIndex() uint64 {
+	return s.volatileInfo.CommitIndex
 }
