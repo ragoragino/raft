@@ -477,11 +477,11 @@ func TestCreateAndGetDocuments(t *testing.T) {
 	// Add key-value pairs to the Raft in parallel
 	nOfWorkers := 256
 	nOfClientRequests := 1000
-	workerCreateRequestChannel := make(chan *external_server.ClusterCreateRequest, nOfClientRequests)
-	workerGetRequestChannel := make(chan *external_server.ClusterCreateRequest, nOfClientRequests)
+	workerCreateRequestChannel := make(chan *external_server.ClientCreateRequest, nOfClientRequests)
+	workerGetRequestChannel := make(chan *external_server.ClientCreateRequest, nOfClientRequests)
 	for i := 0; i != nOfClientRequests; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		request := &external_server.ClusterCreateRequest{
+		request := &external_server.ClientCreateRequest{
 			Key:   key,
 			Value: []byte(fmt.Sprintf("value-%d", i)),
 		}
@@ -532,7 +532,7 @@ func TestCreateAndGetDocuments(t *testing.T) {
 			defer wgClientGetRequests.Done()
 
 			for request := range workerGetRequestChannel {
-				getRequestJson, err := json.Marshal(&external_server.ClusterGetRequest{
+				getRequestJson, err := json.Marshal(&external_server.ClientGetRequest{
 					Key: request.Key,
 				})
 				assert.NoError(t, err)
@@ -673,14 +673,14 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 
 	httpEndpoint := httpEndpoints[leaderNode]
 
-	clientCreateRequests := map[string]*external_server.ClusterCreateRequest{}
+	clientCreateRequests := map[string]*external_server.ClientCreateRequest{}
 
 	// Add first key-value pairs to the Raft
 	nOfStartingRequests := 10
 	nOfTotalRequests := 20
 	for i := 0; i != nOfStartingRequests; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		request := &external_server.ClusterCreateRequest{
+		request := &external_server.ClientCreateRequest{
 			Key:   key,
 			Value: []byte(fmt.Sprintf("value-%d", i)),
 		}
@@ -723,7 +723,7 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 	// Add new key-value pairs to Raft
 	for i := nOfStartingRequests; i != nOfTotalRequests; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		request := &external_server.ClusterCreateRequest{
+		request := &external_server.ClientCreateRequest{
 			Key:   key,
 			Value: []byte(fmt.Sprintf("value-%d", i)),
 		}
@@ -791,4 +791,9 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 	wgServer.Wait()
 	wgRaft.Wait()
 	wgHTTP.Wait()
+}
+
+// TODO
+func TestStress(t *testing.T) {
+
 }

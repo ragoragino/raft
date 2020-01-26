@@ -1,5 +1,4 @@
-18.01.2019:
-- remove index from log !!!
-- Implement batching client requests 
-- Finish HTTP server methods as DELETE, UPDATE (+ allow parallel GET)
+26.01.2019:
+- Finish stress test
+- Finish DELETE HTTP
 - http://cricca.disi.unitn.it/montresor/teaching/ds2/slides/

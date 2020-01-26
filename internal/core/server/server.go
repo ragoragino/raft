@@ -24,6 +24,10 @@ type ClientGetRequest struct {
 	Key string
 }
 
+type ClientDeleteRequest struct {
+	Key string
+}
+
 type ClientGetResponse struct {
 	Value []byte
 }
@@ -40,55 +44,77 @@ const (
 	RequestIDKey = "id"
 )
 
-type ClusterRequest interface{}
-
-type ClusterResponse interface{}
-
 type ClusterMessage struct {
 	Error      error
 	LeaderName string
 }
 
+type ClusterRequest struct {
+	Context context.Context
+}
+
 type ClusterCreateRequest struct {
-	Key   string
-	Value []byte
+	ClusterRequest
+	Key             string
+	Value           []byte
+	ResponseChannel chan<- ClusterCreateResponse
 }
 
 type ClusterGetRequest struct {
-	Key string
+	ClusterRequest
+	Key             string
+	ResponseChannel chan<- ClusterGetResponse
 }
 
-// Request / Response must be either ClusterCreateRequest / ClusterCreateResponse
-// or ClustereGetRequest / ClusterGetResponse
-type ClusterRequestWrapper struct {
-	Context         context.Context
-	Request         ClusterRequest
-	ResponseChannel chan<- ClusterResponse
+type ClusterDeleteRequest struct {
+	ClusterRequest
+	Key             string
+	ResponseChannel chan<- ClusterDeleteResponse
+}
+
+type ClusterResponse struct {
+	StatusCode ClusterStatusCode
+	Message    ClusterMessage
 }
 
 type ClusterCreateResponse struct {
-	StatusCode ClusterStatusCode
-	Message    ClusterMessage
+	ClusterResponse
 }
 
 type ClusterGetResponse struct {
-	StatusCode ClusterStatusCode
-	Message    ClusterMessage
-	Value      []byte
+	ClusterResponse
+	Value []byte
+}
+
+type ClusterDeleteResponse struct {
+	ClusterResponse
+}
+
+type RequestsChannelsSub struct {
+	ClusterCreateRequestChan <-chan ClusterCreateRequest
+	ClusterGetRequestChan    <-chan ClusterGetRequest
+	ClusterDeleteRequestChan <-chan ClusterDeleteRequest
+}
+
+type requestsChannelsPub struct {
+	ClusterCreateRequestChan chan<- ClusterCreateRequest
+	ClusterGetRequestChan    chan<- ClusterGetRequest
+	ClusterDeleteRequestChan chan<- ClusterDeleteRequest
 }
 
 type Interface interface {
 	Run() error
 	Shutdown(ctx context.Context) error
-	GetRequestChannel() (<-chan ClusterRequestWrapper, error)
+	GetRequestsChannels() (*RequestsChannelsSub, error)
 }
 
 type ExternalServer struct {
-	server                *http.Server
-	router                *mux.Router
-	requestProcessChannel chan ClusterRequestWrapper
-	logger                *logrus.Entry
-	nodesEndpoints        map[string]string
+	server              *http.Server
+	router              *mux.Router
+	requestsChannelsSub *RequestsChannelsSub
+	requestsChannelsPub *requestsChannelsPub
+	logger              *logrus.Entry
+	nodesEndpoints      map[string]string
 }
 
 func New(endpoint string, nodesEndpoints map[string]string, logger *logrus.Entry) *ExternalServer {
@@ -99,6 +125,7 @@ func New(endpoint string, nodesEndpoints map[string]string, logger *logrus.Entry
 
 	r := mux.NewRouter()
 	r.HandleFunc("/create", externalServer.handleCreate).Methods("POST")
+	r.HandleFunc("/delete", externalServer.handleDelete).Methods("POST")
 	r.HandleFunc("/get", externalServer.handleGet).Methods("POST")
 
 	s := &http.Server{
@@ -116,8 +143,10 @@ func New(endpoint string, nodesEndpoints map[string]string, logger *logrus.Entry
 
 func (s *ExternalServer) Shutdown(ctx context.Context) error {
 	defer func() {
-		if s.requestProcessChannel != nil {
-			close(s.requestProcessChannel)
+		if s.requestsChannelsPub != nil {
+			close(s.requestsChannelsPub.ClusterCreateRequestChan)
+			close(s.requestsChannelsPub.ClusterGetRequestChan)
+			close(s.requestsChannelsPub.ClusterDeleteRequestChan)
 		}
 	}()
 
@@ -136,13 +165,26 @@ func (s *ExternalServer) Run() error {
 	return nil
 }
 
-func (s *ExternalServer) GetRequestChannel() (<-chan ClusterRequestWrapper, error) {
-	if s.requestProcessChannel != nil {
+func (s *ExternalServer) GetRequestsChannels() (*RequestsChannelsSub, error) {
+	if s.requestsChannelsPub != nil {
 		return nil, fmt.Errorf("request channel was already taken.")
 	}
 
-	s.requestProcessChannel = make(chan ClusterRequestWrapper)
-	return s.requestProcessChannel, nil
+	createRequestChannel := make(chan ClusterCreateRequest)
+	getRequestChannel := make(chan ClusterGetRequest)
+	deleteRequestChannel := make(chan ClusterDeleteRequest)
+
+	s.requestsChannelsPub = &requestsChannelsPub{
+		ClusterCreateRequestChan: createRequestChannel,
+		ClusterGetRequestChan:    getRequestChannel,
+		ClusterDeleteRequestChan: deleteRequestChannel,
+	}
+
+	return &RequestsChannelsSub{
+		ClusterCreateRequestChan: createRequestChannel,
+		ClusterGetRequestChan:    getRequestChannel,
+		ClusterDeleteRequestChan: deleteRequestChannel,
+	}, nil
 }
 
 func (s *ExternalServer) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -153,46 +195,81 @@ func (s *ExternalServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clusterRequest := ClusterCreateRequest{
-		Key:   clientRequest.Key,
-		Value: clientRequest.Value,
-	}
-
 	ctx := context.WithValue(r.Context(), RequestIDKey, uuid.New().String())
 
-	responseChannel := make(chan ClusterResponse)
-	s.requestProcessChannel <- ClusterRequestWrapper{
-		Context:         ctx,
-		Request:         &clusterRequest,
+	responseChannel := make(chan ClusterCreateResponse)
+	s.requestsChannelsPub.ClusterCreateRequestChan <- ClusterCreateRequest{
+		ClusterRequest:  ClusterRequest{Context: ctx},
+		Key:             clientRequest.Key,
+		Value:           clientRequest.Value,
 		ResponseChannel: responseChannel,
 	}
 
 	clusterResponse := <-responseChannel
 
-	switch responseTyped := clusterResponse.(type) {
-	case ClusterCreateResponse:
-		switch responseTyped.StatusCode {
-		case Ok:
-			w.WriteHeader(http.StatusOK)
-			return
-		case FailedInternal:
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		case Redirect:
-			leaderAddress, ok := s.nodesEndpoints[responseTyped.Message.LeaderName]
-			if !ok {
-				s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
-					responseTyped.Message.LeaderName, s.nodesEndpoints)
-			}
-
-			// Return StatusTemporaryRedirect, as only 307 and 308 statuses
-			// force http clients to follow redirects with the same methods
-			endpoint := "http://" + leaderAddress + "/create"
-			http.Redirect(w, r, endpoint, http.StatusTemporaryRedirect)
-			return
+	switch clusterResponse.StatusCode {
+	case Ok:
+		w.WriteHeader(http.StatusOK)
+		return
+	case FailedInternal:
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	case Redirect:
+		leaderAddress, ok := s.nodesEndpoints[clusterResponse.Message.LeaderName]
+		if !ok {
+			s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
+				clusterResponse.Message.LeaderName, s.nodesEndpoints)
 		}
-	default:
-		s.logger.Panicf("wrong response type. Received: %+v", responseTyped)
+
+		// Return StatusTemporaryRedirect, as only 307 and 308 statuses
+		// force http clients to follow redirects with the same methods
+		endpoint := "http://" + leaderAddress + "/create"
+		http.Redirect(w, r, endpoint, http.StatusTemporaryRedirect)
+		return
+	}
+}
+
+func (s *ExternalServer) handleDelete(w http.ResponseWriter, r *http.Request) {
+	clientRequest := &ClientDeleteRequest{}
+	err := json.NewDecoder(r.Body).Decode(clientRequest)
+	if err != nil || !s.validateClientDeleteRequest(clientRequest) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.WithValue(r.Context(), RequestIDKey, uuid.New().String())
+
+	responseChannel := make(chan ClusterDeleteResponse)
+	s.requestsChannelsPub.ClusterDeleteRequestChan <- ClusterDeleteRequest{
+		ClusterRequest:  ClusterRequest{Context: ctx},
+		Key:             clientRequest.Key,
+		ResponseChannel: responseChannel,
+	}
+
+	clusterResponse := <-responseChannel
+
+	switch clusterResponse.StatusCode {
+	case Ok:
+		w.WriteHeader(http.StatusOK)
+		return
+	case FailedInternal:
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	case FailedNotFound:
+		w.WriteHeader(http.StatusNotFound)
+		return
+	case Redirect:
+		leaderAddress, ok := s.nodesEndpoints[clusterResponse.Message.LeaderName]
+		if !ok {
+			s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
+				clusterResponse.Message.LeaderName, s.nodesEndpoints)
+		}
+
+		// Return StatusTemporaryRedirect, as only 307 and 308 statuses
+		// force http clients to follow redirects with the same methods
+		endpoint := "http://" + leaderAddress + "/get"
+		http.Redirect(w, r, endpoint, http.StatusTemporaryRedirect)
+		return
 	}
 }
 
@@ -204,57 +281,48 @@ func (s *ExternalServer) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clusterRequest := ClusterGetRequest{
-		Key: clientRequest.Key,
-	}
-
 	ctx := context.WithValue(r.Context(), RequestIDKey, uuid.New().String())
 
-	responseChannel := make(chan ClusterResponse)
-	s.requestProcessChannel <- ClusterRequestWrapper{
-		Context:         ctx,
-		Request:         &clusterRequest,
+	responseChannel := make(chan ClusterGetResponse)
+	s.requestsChannelsPub.ClusterGetRequestChan <- ClusterGetRequest{
+		ClusterRequest:  ClusterRequest{Context: ctx},
+		Key:             clientRequest.Key,
 		ResponseChannel: responseChannel,
 	}
 
 	clusterResponse := <-responseChannel
 
-	switch responseTyped := clusterResponse.(type) {
-	case ClusterGetResponse:
-		switch responseTyped.StatusCode {
-		case Ok:
-			clientResponse := ClientGetResponse{
-				Value: responseTyped.Value,
-			}
-			buffer, err := json.Marshal(clientResponse)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			w.Write(buffer)
-			return
-		case FailedInternal:
+	switch clusterResponse.StatusCode {
+	case Ok:
+		clientResponse := ClientGetResponse{
+			Value: clusterResponse.Value,
+		}
+		buffer, err := json.Marshal(clientResponse)
+		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
-		case FailedNotFound:
-			w.WriteHeader(http.StatusNotFound)
-			return
-		case Redirect:
-			leaderAddress, ok := s.nodesEndpoints[responseTyped.Message.LeaderName]
-			if !ok {
-				s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
-					responseTyped.Message.LeaderName, s.nodesEndpoints)
-			}
-
-			// Return StatusTemporaryRedirect, as only 307 and 308 statuses
-			// force http clients to follow redirects with the same methods
-			endpoint := "http://" + leaderAddress + "/get"
-			http.Redirect(w, r, endpoint, http.StatusTemporaryRedirect)
-			return
 		}
-	default:
-		s.logger.Panicf("wrong response type. Received: %+v", responseTyped)
+
+		w.Write(buffer)
+		return
+	case FailedInternal:
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	case FailedNotFound:
+		w.WriteHeader(http.StatusNotFound)
+		return
+	case Redirect:
+		leaderAddress, ok := s.nodesEndpoints[clusterResponse.Message.LeaderName]
+		if !ok {
+			s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
+				clusterResponse.Message.LeaderName, s.nodesEndpoints)
+		}
+
+		// Return StatusTemporaryRedirect, as only 307 and 308 statuses
+		// force http clients to follow redirects with the same methods
+		endpoint := "http://" + leaderAddress + "/get"
+		http.Redirect(w, r, endpoint, http.StatusTemporaryRedirect)
+		return
 	}
 }
 
@@ -263,5 +331,9 @@ func (s *ExternalServer) validateClientCreateRequest(request *ClientCreateReques
 }
 
 func (s *ExternalServer) validateClientGetRequest(request *ClientGetRequest) bool {
+	return request.Key != ""
+}
+
+func (s *ExternalServer) validateClientDeleteRequest(request *ClientDeleteRequest) bool {
 	return request.Key != ""
 }

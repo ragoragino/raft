@@ -22,7 +22,7 @@ func TestHandlersCreate(t *testing.T) {
 
 	server := New("localhost:80", map[string]string{"Node0": "127.0.0.1:8001"},
 		logger.WithFields(logrus.Fields{"component": "server"}))
-	ch, err := server.GetRequestChannel()
+	ch, err := server.GetRequestsChannels()
 	assert.NoError(t, err)
 
 	handler := http.HandlerFunc(server.handleCreate)
@@ -41,7 +41,7 @@ func TestHandlersCreate(t *testing.T) {
 				Value: []byte("value"),
 			},
 			clusterResponse: ClusterCreateResponse{
-				StatusCode: Ok,
+				ClusterResponse: ClusterResponse{StatusCode: Ok},
 			},
 			expectedClusterRequest: &ClusterCreateRequest{
 				Key:   "key",
@@ -56,9 +56,11 @@ func TestHandlersCreate(t *testing.T) {
 				Value: []byte("value"),
 			},
 			clusterResponse: ClusterCreateResponse{
-				StatusCode: Redirect,
-				Message: ClusterMessage{
-					LeaderName: "Node0",
+				ClusterResponse: ClusterResponse{
+					StatusCode: Redirect,
+					Message: ClusterMessage{
+						LeaderName: "Node0",
+					},
 				},
 			},
 			expectedClusterRequest: &ClusterCreateRequest{
@@ -74,7 +76,7 @@ func TestHandlersCreate(t *testing.T) {
 				Value: []byte("value"),
 			},
 			clusterResponse: ClusterCreateResponse{
-				StatusCode: FailedInternal,
+				ClusterResponse: ClusterResponse{StatusCode: FailedInternal},
 			},
 			expectedClusterRequest: &ClusterCreateRequest{
 				Key:   "key",
@@ -93,17 +95,18 @@ func TestHandlersCreate(t *testing.T) {
 			req, err := http.NewRequest("POST", "/create", reader)
 			assert.NoError(t, err)
 
-			var clusterRequest ClusterRequestWrapper
+			var clusterCreateRequest ClusterCreateRequest
 			go func() {
-				clusterRequest = <-ch
-				clusterRequest.ResponseChannel <- testCase.clusterResponse
+				clusterCreateRequest = <-ch.ClusterCreateRequestChan
+				clusterCreateRequest.ResponseChannel <- testCase.clusterResponse
 			}()
 
 			rr := httptest.NewRecorder()
 			handler.ServeHTTP(rr, req)
 
 			assert.Equal(t, testCase.expectedStatusCode, rr.Code)
-			assert.Equal(t, testCase.expectedClusterRequest, clusterRequest.Request)
+			assert.Equal(t, testCase.expectedClusterRequest.Key, clusterCreateRequest.Key)
+			assert.Equal(t, testCase.expectedClusterRequest.Value, clusterCreateRequest.Value)
 		})
 	}
 }
@@ -118,7 +121,7 @@ func TestHandlersGet(t *testing.T) {
 
 	server := New("localhost:80", map[string]string{"Node0": "127.0.0.1:8001"},
 		logger.WithFields(logrus.Fields{"component": "server"}))
-	ch, err := server.GetRequestChannel()
+	ch, err := server.GetRequestsChannels()
 	assert.NoError(t, err)
 
 	handler := http.HandlerFunc(server.handleGet)
@@ -136,8 +139,8 @@ func TestHandlersGet(t *testing.T) {
 				Key: "key",
 			},
 			clusterResponse: ClusterGetResponse{
-				StatusCode: Ok,
-				Value:      []byte("value"),
+				ClusterResponse: ClusterResponse{StatusCode: Ok},
+				Value:           []byte("value"),
 			},
 			expectedClusterRequest: &ClusterGetRequest{
 				Key: "key",
@@ -150,9 +153,11 @@ func TestHandlersGet(t *testing.T) {
 				Key: "key",
 			},
 			clusterResponse: ClusterGetResponse{
-				StatusCode: Redirect,
-				Message: ClusterMessage{
-					LeaderName: "Node0",
+				ClusterResponse: ClusterResponse{
+					StatusCode: Redirect,
+					Message: ClusterMessage{
+						LeaderName: "Node0",
+					},
 				},
 			},
 			expectedClusterRequest: &ClusterGetRequest{
@@ -166,7 +171,7 @@ func TestHandlersGet(t *testing.T) {
 				Key: "key",
 			},
 			clusterResponse: ClusterGetResponse{
-				StatusCode: FailedInternal,
+				ClusterResponse: ClusterResponse{StatusCode: FailedInternal},
 			},
 			expectedClusterRequest: &ClusterGetRequest{
 				Key: "key",
@@ -184,17 +189,17 @@ func TestHandlersGet(t *testing.T) {
 			req, err := http.NewRequest("POST", "/create", reader)
 			assert.NoError(t, err)
 
-			var clusterRequest ClusterRequestWrapper
+			var clusterGetRequest ClusterGetRequest
 			go func() {
-				clusterRequest = <-ch
-				clusterRequest.ResponseChannel <- testCase.clusterResponse
+				clusterGetRequest = <-ch.ClusterGetRequestChan
+				clusterGetRequest.ResponseChannel <- testCase.clusterResponse
 			}()
 
 			rr := httptest.NewRecorder()
 			handler.ServeHTTP(rr, req)
 
 			assert.Equal(t, testCase.expectedStatusCode, rr.Code)
-			assert.Equal(t, testCase.expectedClusterRequest, clusterRequest.Request)
+			assert.Equal(t, testCase.expectedClusterRequest.Key, clusterGetRequest.Key)
 
 			if testCase.clusterResponse.Value != nil {
 				body := rr.Body.String()
@@ -204,6 +209,98 @@ func TestHandlersGet(t *testing.T) {
 
 				assert.Equal(t, testCase.clusterResponse.Value, response.Value)
 			}
+		})
+	}
+}
+
+func TestHandlersDelete(t *testing.T) {
+	logrus.SetLevel(logrus.DebugLevel)
+
+	logger := logrus.StandardLogger()
+	logger.SetFormatter(&logrus.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
+	})
+
+	server := New("localhost:80", map[string]string{"Node0": "127.0.0.1:8001"},
+		logger.WithFields(logrus.Fields{"component": "server"}))
+	ch, err := server.GetRequestsChannels()
+	assert.NoError(t, err)
+
+	handler := http.HandlerFunc(server.handleDelete)
+
+	testCases := []struct {
+		name                   string
+		clientDeleteRequest    ClientDeleteRequest
+		clusterResponse        ClusterDeleteResponse
+		expectedClusterRequest *ClusterDeleteRequest
+		expectedStatusCode     int
+	}{
+		{
+			name: "ok",
+			clientDeleteRequest: ClientDeleteRequest{
+				Key: "key",
+			},
+			clusterResponse: ClusterDeleteResponse{
+				ClusterResponse: ClusterResponse{StatusCode: Ok},
+			},
+			expectedClusterRequest: &ClusterDeleteRequest{
+				Key: "key",
+			},
+			expectedStatusCode: http.StatusOK,
+		},
+		{
+			name: "redirect",
+			clientDeleteRequest: ClientDeleteRequest{
+				Key: "key",
+			},
+			clusterResponse: ClusterDeleteResponse{
+				ClusterResponse: ClusterResponse{
+					StatusCode: Redirect,
+					Message: ClusterMessage{
+						LeaderName: "Node0",
+					},
+				},
+			},
+			expectedClusterRequest: &ClusterDeleteRequest{
+				Key: "key",
+			},
+			expectedStatusCode: http.StatusTemporaryRedirect,
+		},
+		{
+			name: "failed",
+			clientDeleteRequest: ClientDeleteRequest{
+				Key: "key",
+			},
+			clusterResponse: ClusterDeleteResponse{
+				ClusterResponse: ClusterResponse{StatusCode: FailedInternal},
+			},
+			expectedClusterRequest: &ClusterDeleteRequest{
+				Key: "key",
+			},
+			expectedStatusCode: http.StatusInternalServerError,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			buffer, err := json.Marshal(testCase.clientDeleteRequest)
+			assert.NoError(t, err)
+
+			reader := bytes.NewReader(buffer)
+			req, err := http.NewRequest("POST", "/delete", reader)
+			assert.NoError(t, err)
+
+			var clusterDeleteRequest ClusterDeleteRequest
+			go func() {
+				clusterDeleteRequest = <-ch.ClusterDeleteRequestChan
+				clusterDeleteRequest.ResponseChannel <- testCase.clusterResponse
+			}()
+
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			assert.Equal(t, testCase.expectedStatusCode, rr.Code)
+			assert.Equal(t, testCase.expectedClusterRequest.Key, clusterDeleteRequest.Key)
 		})
 	}
 }
