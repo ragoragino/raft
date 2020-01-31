@@ -106,11 +106,6 @@ const (
 	requestIDKey = "id"
 )
 
-type clientLog struct {
-	Key   string
-	Value []byte
-}
-
 type appendEntriesEvent struct {
 	byLeader bool
 }
@@ -315,6 +310,9 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 
 	go func() {
 		electionTimeout := newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+		timer := NewTimer(electionTimeout)
+		defer timer.Close()
+
 		electionTimedChannel := make(chan struct{})
 		defer close(electionTimedChannel)
 
@@ -346,6 +344,7 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 
 				if event.byLeader {
 					electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+					timer.Reset(electionTimeout)
 				}
 			case event, ok := <-r.requestVoteHandlersChannel:
 				if !ok {
@@ -354,13 +353,15 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 
 				if event.voteGranted {
 					electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+					timer.Reset(electionTimeout)
 				}
-			case <-time.After(electionTimeout):
+			case <-timer.After():
 				electionTimedChannel <- struct{}{}
 
 				// Reset election timeout, so that we won't be always falling into this case
 				// when it takes some time to propagate the new state
 				electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+				timer.Reset(electionTimeout)
 			case <-ctx.Done():
 				break outerloop
 			}
@@ -377,6 +378,8 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
 
 	go func() {
 		electionTimeout := newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+		timer := NewTimer(electionTimeout)
+		defer timer.Close()
 
 		ctxWithRequestID := createNewRequestContext()
 
@@ -394,11 +397,13 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
 				if !ok {
 					r.logger.Panicf("requestVoteHandlersChannel was unexpectedly closed")
 				}
-			case <-time.After(electionTimeout):
+			case <-timer.After():
 				cancel()
 				r.logger.Debugf("election timed out without a winner, broadcasting new vote")
 
 				electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+				timer.Reset(electionTimeout)
+
 				innerCtx, cancel = context.WithTimeout(ctxWithRequestID, r.settings.MinElectionTimeout)
 				go r.broadcastRequestVote(innerCtx)
 			case <-ctx.Done():
@@ -696,7 +701,6 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 								}
 
 								indexToAppendFrom := uint64(len(entries)) - nOfLogToAppend
-								logger.Debugf("%d, %d, %d, %d", indexToAppendFrom, len(entries), requestedNewLogIndex, lastLogIndex)
 								entries = entries[indexToAppendFrom:]
 							}
 						}
