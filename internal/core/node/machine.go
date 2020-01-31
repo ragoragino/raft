@@ -2,9 +2,11 @@ package node
 
 import (
 	"encoding/json"
-	logrus "github.com/sirupsen/logrus"
+	pb "raft/internal/core/node/gen"
 	"raft/internal/core/persister"
 	"sync"
+
+	logrus "github.com/sirupsen/logrus"
 )
 
 type IStateMachine interface {
@@ -50,13 +52,13 @@ func (sm *StateMachine) LoadState(writeChannel <-chan persister.CommandLog) erro
 	sm.stateMutex.RLock()
 	defer sm.stateMutex.RUnlock()
 	for log := range writeChannel {
-		clientLogMarshalled := clientLog{}
+		clientLogMarshalled := pb.AppendEntriesRequest_Entry{}
 		err := json.Unmarshal(log.Command, &clientLogMarshalled)
 		if err != nil {
 			return err
 		}
 
-		sm.state[clientLogMarshalled.Key] = clientLogMarshalled.Value
+		sm.state[clientLogMarshalled.Key] = clientLogMarshalled.GetPayload()
 	}
 
 	return nil

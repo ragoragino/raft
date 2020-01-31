@@ -24,6 +24,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TODO: These tests resemble more integration tests than unit tests,
+// so writing proper unit tests could be helpful
+
 var (
 	startingStateInfo = PersistentStateInfo{
 		CurrentTerm: 0,
@@ -477,11 +480,11 @@ func TestCreateAndGetDocuments(t *testing.T) {
 	// Add key-value pairs to the Raft in parallel
 	nOfWorkers := 256
 	nOfClientRequests := 1000
-	workerCreateRequestChannel := make(chan *external_server.ClusterCreateRequest, nOfClientRequests)
-	workerGetRequestChannel := make(chan *external_server.ClusterCreateRequest, nOfClientRequests)
+	workerCreateRequestChannel := make(chan *external_server.ClientCreateRequest, nOfClientRequests)
+	workerGetRequestChannel := make(chan *external_server.ClientCreateRequest, nOfClientRequests)
 	for i := 0; i != nOfClientRequests; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		request := &external_server.ClusterCreateRequest{
+		request := &external_server.ClientCreateRequest{
 			Key:   key,
 			Value: []byte(fmt.Sprintf("value-%d", i)),
 		}
@@ -532,7 +535,7 @@ func TestCreateAndGetDocuments(t *testing.T) {
 			defer wgClientGetRequests.Done()
 
 			for request := range workerGetRequestChannel {
-				getRequestJson, err := json.Marshal(&external_server.ClusterGetRequest{
+				getRequestJson, err := json.Marshal(&external_server.ClientGetRequest{
 					Key: request.Key,
 				})
 				assert.NoError(t, err)
@@ -673,14 +676,14 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 
 	httpEndpoint := httpEndpoints[leaderNode]
 
-	clientCreateRequests := map[string]*external_server.ClusterCreateRequest{}
+	clientCreateRequests := map[string]*external_server.ClientCreateRequest{}
 
 	// Add first key-value pairs to the Raft
 	nOfStartingRequests := 10
 	nOfTotalRequests := 20
 	for i := 0; i != nOfStartingRequests; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		request := &external_server.ClusterCreateRequest{
+		request := &external_server.ClientCreateRequest{
 			Key:   key,
 			Value: []byte(fmt.Sprintf("value-%d", i)),
 		}
@@ -723,7 +726,7 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 	// Add new key-value pairs to Raft
 	for i := nOfStartingRequests; i != nOfTotalRequests; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		request := &external_server.ClusterCreateRequest{
+		request := &external_server.ClientCreateRequest{
 			Key:   key,
 			Value: []byte(fmt.Sprintf("value-%d", i)),
 		}
@@ -769,6 +772,169 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, value.Value, stateMachineValue)
 	}
+
+	// Close HTTP and cluster servers, Raft instances and cluster clients down
+	for _, httpServer := range httpServers {
+		err := httpServer.Shutdown(context.Background())
+		assert.NoError(t, err)
+	}
+
+	for _, clusterServer := range clusterServers {
+		clusterServer.Close()
+	}
+
+	for _, raft := range rafts {
+		raft.Close()
+	}
+
+	for _, clusterClients := range clusterClients {
+		clusterClients.Close()
+	}
+
+	wgServer.Wait()
+	wgRaft.Wait()
+	wgHTTP.Wait()
+}
+
+func TestContinuousTraffic(t *testing.T) {
+	logrus.SetLevel(logrus.DebugLevel)
+
+	logger := logrus.StandardLogger()
+	logger.SetFormatter(&logrus.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
+	})
+
+	endpoints := map[string]string{
+		"Node0": "localhost:10000",
+		"Node1": "localhost:10001",
+		"Node2": "localhost:10002",
+	}
+
+	httpEndpoints := map[string]string{
+		"Node0": "localhost:8000",
+		"Node1": "localhost:8001",
+		"Node2": "localhost:8002",
+	}
+
+	rafts, clusterClients, clusterServers, httpServers, clean := constructClusterComponents(t, logger, endpoints, httpEndpoints)
+	defer clean()
+
+	wgServer := startClusterServers(t, clusterServers)
+
+	startClusterClients(t, clusterClients, endpoints)
+
+	wgRaft := startRaftEngines(rafts)
+
+	wgHTTP := startHttpServer(t, httpServers)
+
+	// Wait for the election of leader
+	timeToWait := defaultRaftOptions.MaxElectionTimeout + defaultRaftOptions.MinElectionTimeout
+	time.Sleep(2 * timeToWait)
+
+	client := &http.Client{}
+
+	// Start at a random node
+	httpEndpoint := httpEndpoints["Node0"]
+
+	stressTestDuration := 30 * time.Second
+	stressTestCtx, cancel := context.WithTimeout(context.Background(), stressTestDuration)
+	defer cancel()
+
+	// Add key-value pairs to the Raft in parallel
+	nOfWorkers := 24
+	workerGetRequestChannel := make(chan *external_server.ClientCreateRequest)
+
+	wgClientCreateRequests := sync.WaitGroup{}
+	wgClientCreateRequests.Add(nOfWorkers)
+	for i := 0; i != nOfWorkers; i++ {
+		go func(i int) {
+			defer wgClientCreateRequests.Done()
+
+			for {
+				<-time.After(100 * time.Millisecond)
+
+				key := fmt.Sprintf("key-%d", i)
+				request := &external_server.ClientCreateRequest{
+					Key:   key,
+					Value: []byte(fmt.Sprintf("value-%d", i)),
+				}
+
+				createRequestJson, err := json.Marshal(request)
+				assert.NoError(t, err)
+
+				createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJson))
+				assert.NoError(t, err)
+
+				// Set GetBody so that client can copy body to follow redirects
+				createRequest.GetBody = func() (io.ReadCloser, error) {
+					return ioutil.NopCloser(bytes.NewBuffer(createRequestJson)), nil
+				}
+
+				createResponse, err := client.Do(createRequest)
+				assert.NoError(t, err)
+				assert.Equal(t, http.StatusOK, createResponse.StatusCode)
+
+				createResponse.Body.Close()
+
+				select {
+				case <-stressTestCtx.Done():
+					return
+				case workerGetRequestChannel <- request:
+				}
+			}
+		}(i)
+	}
+
+	// Get key-value pairs from Raft
+	wgClientGetRequests := sync.WaitGroup{}
+	wgClientGetRequests.Add(nOfWorkers)
+	for i := 0; i != nOfWorkers; i++ {
+		go func() {
+			defer wgClientGetRequests.Done()
+
+			for {
+				<-time.After(100 * time.Millisecond)
+
+				var request *external_server.ClientCreateRequest
+				select {
+				case <-stressTestCtx.Done():
+					return
+				case request = <-workerGetRequestChannel:
+				}
+
+				getRequestJson, err := json.Marshal(&external_server.ClientGetRequest{
+					Key: request.Key,
+				})
+				assert.NoError(t, err)
+
+				getRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/get", bytes.NewBuffer(getRequestJson))
+				assert.NoError(t, err)
+
+				// Set GetBody so that client can copy body to follow redirects
+				getRequest.GetBody = func() (io.ReadCloser, error) {
+					return ioutil.NopCloser(bytes.NewBuffer(getRequestJson)), nil
+				}
+
+				getResponse, err := client.Do(getRequest)
+				assert.NoError(t, err)
+				assert.Equal(t, http.StatusOK, getResponse.StatusCode)
+
+				getResponseJson, err := ioutil.ReadAll(getResponse.Body)
+				assert.NoError(t, err)
+
+				response := &external_server.ClientGetResponse{}
+				err = json.Unmarshal(getResponseJson, response)
+				assert.NoError(t, err)
+
+				assert.Equal(t, request.Value, response.Value)
+
+				getResponse.Body.Close()
+			}
+		}()
+	}
+
+	wgClientCreateRequests.Wait()
+	wgClientGetRequests.Wait()
 
 	// Close HTTP and cluster servers, Raft instances and cluster clients down
 	for _, httpServer := range httpServers {

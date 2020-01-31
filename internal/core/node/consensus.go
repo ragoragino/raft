@@ -106,11 +106,6 @@ const (
 	requestIDKey = "id"
 )
 
-type clientLog struct {
-	Key   string
-	Value []byte
-}
-
 type appendEntriesEvent struct {
 	byLeader bool
 }
@@ -143,7 +138,7 @@ type Raft struct {
 	appendEntriesProcessChannel <-chan appendEntriesProcessRequest
 	requestVoteProcessChannel   <-chan requestVoteProcessRequest
 
-	clientRequestChannel <-chan external_server.ClusterRequestWrapper
+	clientRequestsChannels *external_server.RequestsChannelsSub
 
 	retryNodeAppendEntriesChannels map[string]chan *retryNodeAppendEntriesRequest
 	retryNodeHeartbeatChannels     map[string]chan *retryNodeAppendEntriesRequest
@@ -162,7 +157,7 @@ func NewRaft(logger *logrus.Entry, stateManager IStateManager, logManager ILogEn
 		logger.Panicf("unable to obtain cluster server RequestVote channel: %+v", err)
 	}
 
-	clientRequestChannel, err := externelServer.GetRequestChannel()
+	clientRequestsChannels, err := externelServer.GetRequestsChannels()
 	if err != nil {
 		logger.Panicf("unable to obtain external server channel: %+v", err)
 	}
@@ -180,7 +175,7 @@ func NewRaft(logger *logrus.Entry, stateManager IStateManager, logManager ILogEn
 		requestVoteHandlersChannel:   make(chan requestVoteEvent),
 		appendEntriesProcessChannel:  appendEntriesProcessChannel,
 		requestVoteProcessChannel:    requestVoteProcessChannel,
-		clientRequestChannel:         clientRequestChannel,
+		clientRequestsChannels:       clientRequestsChannels,
 	}
 
 	return raft
@@ -315,6 +310,9 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 
 	go func() {
 		electionTimeout := newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+		timer := NewTimer(electionTimeout)
+		defer timer.Close()
+
 		electionTimedChannel := make(chan struct{})
 		defer close(electionTimedChannel)
 
@@ -346,6 +344,7 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 
 				if event.byLeader {
 					electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+					timer.Reset(electionTimeout)
 				}
 			case event, ok := <-r.requestVoteHandlersChannel:
 				if !ok {
@@ -354,13 +353,15 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 
 				if event.voteGranted {
 					electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+					timer.Reset(electionTimeout)
 				}
-			case <-time.After(electionTimeout):
+			case <-timer.After():
 				electionTimedChannel <- struct{}{}
 
 				// Reset election timeout, so that we won't be always falling into this case
 				// when it takes some time to propagate the new state
 				electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+				timer.Reset(electionTimeout)
 			case <-ctx.Done():
 				break outerloop
 			}
@@ -377,6 +378,8 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
 
 	go func() {
 		electionTimeout := newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+		timer := NewTimer(electionTimeout)
+		defer timer.Close()
 
 		ctxWithRequestID := createNewRequestContext()
 
@@ -394,11 +397,13 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
 				if !ok {
 					r.logger.Panicf("requestVoteHandlersChannel was unexpectedly closed")
 				}
-			case <-time.After(electionTimeout):
+			case <-timer.After():
 				cancel()
 				r.logger.Debugf("election timed out without a winner, broadcasting new vote")
 
 				electionTimeout = newElectionTimeout(r.settings.MinElectionTimeout, r.settings.MaxElectionTimeout)
+				timer.Reset(electionTimeout)
+
 				innerCtx, cancel = context.WithTimeout(ctxWithRequestID, r.settings.MinElectionTimeout)
 				go r.broadcastRequestVote(innerCtx)
 			case <-ctx.Done():
@@ -607,6 +612,7 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 				previousLogTerm := request.GetPrevLogTerm()
 				leaderID := request.GetLeaderId()
 				leaderCommit := request.GetLeaderCommit()
+				requestedNewLogIndex := previousLogIndex + uint64(len(entries))
 
 				responseFunc := func(sentByLeader bool, entriesAppended bool) {
 					r.appendEntriesHandlersChannel <- appendEntriesEvent{
@@ -689,9 +695,8 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 							} else {
 								// We presuppose that any logs after the first new log are equal
 								lastLogIndex := r.logManager.GetLastLogIndex()
-								newLogIndex := previousLogIndex + uint64(len(entries))
-								nOfLogToAppend := newLogIndex - lastLogIndex
-								if nOfLogToAppend < 0 {
+								nOfLogToAppend := requestedNewLogIndex - lastLogIndex
+								if requestedNewLogIndex < lastLogIndex {
 									nOfLogToAppend = 0
 								}
 
@@ -719,10 +724,26 @@ func (r *Raft) processAppendEntries(done <-chan struct{}) <-chan struct{} {
 					}
 				}
 
-				// Leader should always have his commitIndex lower than the
-				// last entry that is being sent
-				r.commitLogsToStateMachine(appendEntryToProcess.Context, r.stateManager.GetCommitIndex(), leaderCommit)
-				r.stateManager.SetCommitIndex(leaderCommit)
+				// Specs say: If leaderCommit > commitIndex, set commitIndex =
+				// min(leaderCommit, index of last new entry).
+				// Because we do not keep track of last applied, therefore
+				// we set to leaderCommit if localCommitIndex < leaderCommit < indexOfLastNewEntry
+				// we set to indexOfLastNewEntry if localCommitIndex < indexOfLastNewEntry < leaderCommit
+				// we leave localCommitIndex if indexOfLastNewEntry < localCommitIndex < leaderCommit
+				localCommitIndex := r.stateManager.GetCommitIndex()
+				if leaderCommit > localCommitIndex {
+					logger.Debugf("deciding whether to commit: localCommit: %d, newIndex: %d, leaderCommit: %d", localCommitIndex, requestedNewLogIndex, leaderCommit)
+
+					newCommitIndex := localCommitIndex
+					if localCommitIndex <= requestedNewLogIndex && requestedNewLogIndex <= leaderCommit {
+						newCommitIndex = requestedNewLogIndex
+					} else if localCommitIndex <= leaderCommit && leaderCommit <= requestedNewLogIndex {
+						newCommitIndex = leaderCommit
+					}
+
+					r.commitLogsToStateMachine(appendEntryToProcess.Context, localCommitIndex, newCommitIndex)
+					r.stateManager.SetCommitIndex(newCommitIndex)
+				}
 
 				r.stateMutex.Unlock()
 
@@ -848,31 +869,55 @@ func (r *Raft) processRequestVote(done <-chan struct{}) <-chan struct{} {
 func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 	finishChannel := make(chan struct{})
 	go func() {
+		requestChannel := make(chan interface{})
+		go func() {
+			defer close(requestChannel)
+
+			for {
+				select {
+				case request, ok := <-r.clientRequestsChannels.ClusterCreateRequestChan:
+					if !ok {
+						return
+					}
+
+					requestChannel <- request
+				case request, ok := <-r.clientRequestsChannels.ClusterDeleteRequestChan:
+					if !ok {
+						return
+					}
+
+					requestChannel <- request
+				case <-done:
+					return
+				}
+			}
+		}()
+
 	processLoop:
 		for {
-			// TODO: Allow get request processing while processing Create, Update or Delete
 			select {
-			case msg, ok := <-r.clientRequestChannel:
+			case msg, ok := <-requestChannel:
 				if !ok {
 					r.logger.Debugf("channel for processing client requests was closed")
 					break processLoop
 				}
 
-				ctx := contextFromExternalServerContext(msg.Context)
-				logger := loggerFromContext(r.logger, ctx)
+				switch request := msg.(type) {
+				case external_server.ClusterCreateRequest:
+					ctx := contextFromExternalServerContext(request.Context)
 
-				switch request := msg.Request.(type) {
-				case *external_server.ClusterCreateRequest:
-					responseChannel := msg.ResponseChannel
+					responseChannel := request.ResponseChannel
 
-					statusCode := r.processClientCreateRequest(ctx, request)
+					statusCode := r.processClientCreateRequest(ctx, &request)
 					if statusCode == external_server.Redirect {
 						clusterState := r.cluster.GetClusterState()
 
 						responseChannel <- external_server.ClusterCreateResponse{
-							StatusCode: external_server.Redirect,
-							Message: external_server.ClusterMessage{
-								LeaderName: clusterState.leaderName,
+							ClusterResponse: external_server.ClusterResponse{
+								StatusCode: external_server.Redirect,
+								Message: external_server.ClusterMessage{
+									LeaderName: clusterState.leaderName,
+								},
 							},
 						}
 
@@ -880,31 +925,70 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 					}
 
 					responseChannel <- external_server.ClusterCreateResponse{
-						StatusCode: statusCode,
+						ClusterResponse: external_server.ClusterResponse{
+							StatusCode: statusCode,
+						},
 					}
-				case *external_server.ClusterGetRequest:
-					responseChannel := msg.ResponseChannel
+				case external_server.ClusterDeleteRequest:
+					ctx := contextFromExternalServerContext(request.Context)
 
-					value, statusCode := r.processClientGetRequest(ctx, request)
+					responseChannel := request.ResponseChannel
+
+					statusCode := r.processClientDeleteRequest(ctx, &request)
 					if statusCode == external_server.Redirect {
 						clusterState := r.cluster.GetClusterState()
 
-						responseChannel <- external_server.ClusterGetResponse{
-							StatusCode: external_server.Redirect,
-							Message: external_server.ClusterMessage{
-								LeaderName: clusterState.leaderName,
+						responseChannel <- external_server.ClusterDeleteResponse{
+							ClusterResponse: external_server.ClusterResponse{
+								StatusCode: external_server.Redirect,
+								Message: external_server.ClusterMessage{
+									LeaderName: clusterState.leaderName,
+								},
 							},
 						}
 
 						break
 					}
 
-					responseChannel <- external_server.ClusterGetResponse{
-						StatusCode: statusCode,
-						Value:      value,
+					responseChannel <- external_server.ClusterDeleteResponse{
+						ClusterResponse: external_server.ClusterResponse{
+							StatusCode: statusCode,
+						},
 					}
 				default:
-					logger.Panicf("received unknown HTTP request: %+v", request)
+					r.logger.Panicf("received unknown HTTP request: %+v", msg)
+				}
+			case request, ok := <-r.clientRequestsChannels.ClusterGetRequestChan:
+				if !ok {
+					r.logger.Debugf("channel for processing client requests was closed")
+					break processLoop
+				}
+
+				ctx := contextFromExternalServerContext(request.Context)
+
+				responseChannel := request.ResponseChannel
+
+				value, statusCode := r.processClientGetRequest(ctx, &request)
+				if statusCode == external_server.Redirect {
+					clusterState := r.cluster.GetClusterState()
+
+					responseChannel <- external_server.ClusterGetResponse{
+						ClusterResponse: external_server.ClusterResponse{
+							StatusCode: external_server.Redirect,
+							Message: external_server.ClusterMessage{
+								LeaderName: clusterState.leaderName,
+							},
+						},
+					}
+
+					break
+				}
+
+				responseChannel <- external_server.ClusterGetResponse{
+					ClusterResponse: external_server.ClusterResponse{
+						StatusCode: statusCode,
+					},
+					Value: value,
 				}
 			case <-done:
 				break processLoop
@@ -1054,6 +1138,11 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 	}
 
 	return majorityReachedStatus
+}
+
+// TODO
+func (r *Raft) processClientDeleteRequest(ctx context.Context, request *external_server.ClusterDeleteRequest) external_server.ClusterStatusCode {
+	return external_server.Ok
 }
 
 func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-chan struct{} {
