@@ -122,7 +122,17 @@ func constructClusterComponents(t *testing.T,
 			initializeLogEntryPersister(t, logEntryPersisterLogger, fileLogPath)
 		cleanerFuncs = append(cleanerFuncs, fileLogLoggerClean)
 
-		stateHandler := NewStateManager(startingStateInfo, fileStateLogger)
+		matchIndex := map[string]uint64{}
+		for name := range endpoints {
+			matchIndex[name] = 0
+		}
+
+		startingVolatileInfo := VolatileStateInfo{
+			CommitIndex: 0,
+			MatchIndex:  matchIndex,
+		}
+
+		stateHandler := NewStateManager(startingStateInfo, startingVolatileInfo, fileStateLogger)
 		logHandler := NewLogEntryManager(fileLogLogger)
 
 		stateMachineLogger := logger.WithFields(logrus.Fields{
@@ -527,6 +537,11 @@ func TestCreateAndGetDocuments(t *testing.T) {
 
 	endRequestsSend := time.Now()
 
+	// Allow the followers to update their state machines via leader heartbeats
+	time.Sleep(5 * time.Second)
+
+	startRequestsGet := time.Now()
+
 	// Get key-value pairs from Raft
 	wgClientGetRequests := sync.WaitGroup{}
 	wgClientGetRequests.Add(nOfWorkers)
@@ -593,7 +608,7 @@ func TestCreateAndGetDocuments(t *testing.T) {
 	wgHTTP.Wait()
 
 	logger.Printf("Sending requests took: %+v, Getting requests took: %+v",
-		endRequestsSend.Sub(startRequestsSend), endRequestsGet.Sub(endRequestsSend))
+		endRequestsSend.Sub(startRequestsSend), endRequestsGet.Sub(startRequestsGet))
 }
 
 func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
@@ -840,9 +855,15 @@ func TestContinuousTraffic(t *testing.T) {
 	stressTestCtx, cancel := context.WithTimeout(context.Background(), stressTestDuration)
 	defer cancel()
 
+	type clientCreateRequestWithTime struct {
+		request *external_server.ClientCreateRequest
+		time    time.Time
+	}
+
 	// Add key-value pairs to the Raft in parallel
 	nOfWorkers := 24
-	workerGetRequestChannel := make(chan *external_server.ClientCreateRequest)
+	sizeOfRequestBuffer := 100
+	workerGetRequestChannel := make(chan *clientCreateRequestWithTime, sizeOfRequestBuffer)
 
 	wgClientCreateRequests := sync.WaitGroup{}
 	wgClientCreateRequests.Add(nOfWorkers)
@@ -879,7 +900,7 @@ func TestContinuousTraffic(t *testing.T) {
 				select {
 				case <-stressTestCtx.Done():
 					return
-				case workerGetRequestChannel <- request:
+				case workerGetRequestChannel <- &clientCreateRequestWithTime{request, time.Now()}:
 				}
 			}
 		}(i)
@@ -893,17 +914,18 @@ func TestContinuousTraffic(t *testing.T) {
 			defer wgClientGetRequests.Done()
 
 			for {
-				<-time.After(100 * time.Millisecond)
-
-				var request *external_server.ClientCreateRequest
+				var event *clientCreateRequestWithTime
 				select {
 				case <-stressTestCtx.Done():
 					return
-				case request = <-workerGetRequestChannel:
+				case event = <-workerGetRequestChannel:
 				}
 
+				expectedReplicationTime := event.time.Add(5 * time.Second)
+				<-time.After(expectedReplicationTime.Sub(time.Now()))
+
 				getRequestJson, err := json.Marshal(&external_server.ClientGetRequest{
-					Key: request.Key,
+					Key: event.request.Key,
 				})
 				assert.NoError(t, err)
 
@@ -926,7 +948,7 @@ func TestContinuousTraffic(t *testing.T) {
 				err = json.Unmarshal(getResponseJson, response)
 				assert.NoError(t, err)
 
-				assert.Equal(t, request.Value, response.Value)
+				assert.Equal(t, event.request.Value, response.Value)
 
 				getResponse.Body.Close()
 			}

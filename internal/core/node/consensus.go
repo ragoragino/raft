@@ -457,9 +457,6 @@ func (r *Raft) broadcastRequestVote(ctx context.Context) {
 
 	// Check if majority reached
 	if r.checkClusterMajority(countOfVotes) {
-		r.commitLogsToStateMachine(ctx, r.stateManager.GetCommitIndex(), lastLogIndex)
-		r.stateManager.SetCommitIndex(lastLogIndex)
-
 		r.stateManager.SwitchPersistentState(r.stateManager.GetCurrentTerm(), nil, LEADER)
 	}
 }
@@ -509,6 +506,7 @@ func (r *Raft) broadcastHeartbeat(done <-chan struct{}) <-chan struct{} {
 			ctxWithRequestID := createNewRequestContext()
 
 			r.stateMutex.RLock()
+			currentTerm := r.stateManager.GetCurrentTerm()
 			request := &pb.AppendEntriesRequest{
 				Term:         r.stateManager.GetCurrentTerm(),
 				LeaderId:     r.settings.ID,
@@ -525,7 +523,6 @@ func (r *Raft) broadcastHeartbeat(done <-chan struct{}) <-chan struct{} {
 
 			// Check if we are still the leader
 			r.stateMutex.RLock()
-			currentTerm := r.stateManager.GetCurrentTerm()
 			if r.stateManager.GetRole() != LEADER {
 				r.stateMutex.RUnlock()
 				r.logger.Debugf("not a leader anymore, therefore finishing broadcasting heartbeat")
@@ -1076,11 +1073,14 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 					default:
 					}
 
-					// Update the index of the last commited log
+					// Update the index of the last committed log
+					// Check if the terms match, see Figure 8 of the original paper
 					r.stateMutex.Lock()
-					nextLogIndex := previousLogIndex + uint64(len(newEntries))
-					r.commitLogsToStateMachine(ctxWithRequestID, r.stateManager.GetCommitIndex(), nextLogIndex)
-					r.stateManager.SetCommitIndex(nextLogIndex)
+					if currentTerm == r.stateManager.GetCurrentTerm() {
+						nextLogIndex := previousLogIndex + uint64(len(newEntries))
+						r.commitLogsToStateMachine(ctxWithRequestID, r.stateManager.GetCommitIndex(), nextLogIndex)
+						r.stateManager.SetCommitIndex(nextLogIndex)
+					}
 					r.stateMutex.Unlock()
 				})
 			}
