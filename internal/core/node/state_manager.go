@@ -14,6 +14,7 @@ type PersistentStateInfo struct {
 
 type VolatileStateInfo struct {
 	CommitIndex uint64
+	MatchIndex  map[string]uint64
 }
 
 type StateSwitched struct {
@@ -32,6 +33,8 @@ type IStateManager interface {
 
 	SetCommitIndex(uint64)
 	GetCommitIndex() uint64
+	GetMatchIndexes() map[string]uint64
+	SetMatchIndex(nodeID string, index uint64)
 }
 
 type StateManager struct {
@@ -46,7 +49,7 @@ type StateManager struct {
 // StateManager is not safe for concurrent usage, as it is expected to be used
 // mainly with transaction operations. Therefore, clients using StateManager should
 // implement appropriate locking mechanisms
-func NewStateManager(stateInfo PersistentStateInfo, statePersister persister.IStateLogger) *StateManager {
+func NewStateManager(stateInfo PersistentStateInfo, volatileInfo VolatileStateInfo, statePersister persister.IStateLogger) *StateManager {
 	statePersister.UpdateState(&persister.State{
 		VotedFor:    stateInfo.VotedFor,
 		CurrentTerm: stateInfo.CurrentTerm,
@@ -54,6 +57,7 @@ func NewStateManager(stateInfo PersistentStateInfo, statePersister persister.ISt
 
 	return &StateManager{
 		persistentInfo: stateInfo,
+		volatileInfo:   volatileInfo,
 		statePersister: statePersister,
 		handlers:       make(map[string]chan StateSwitched),
 	}
@@ -112,4 +116,12 @@ func (s *StateManager) SetCommitIndex(commitIndex uint64) {
 
 func (s *StateManager) GetCommitIndex() uint64 {
 	return s.volatileInfo.CommitIndex
+}
+
+func (s *StateManager) GetMatchIndexes() map[string]uint64 {
+	return s.volatileInfo.MatchIndex
+}
+
+func (s *StateManager) SetMatchIndex(nodeID string, index uint64) {
+	s.volatileInfo.MatchIndex[nodeID] = index
 }
