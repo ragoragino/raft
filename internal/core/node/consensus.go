@@ -5,7 +5,6 @@ package node
 import (
 	"context"
 	// "github.com/sasha-s/go-deadlock"
-	"github.com/google/uuid"
 	"math"
 	"math/rand"
 	pb "raft/internal/core/node/gen"
@@ -15,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	logrus "github.com/sirupsen/logrus"
 )
 
@@ -23,12 +24,14 @@ type raftOptions struct {
 	HeartbeatFrequency         time.Duration
 	MaxElectionTimeout         time.Duration
 	MinElectionTimeout         time.Duration
+	BroadcastTimeout           time.Duration
 	AppendEntryRetryBufferSize int
 }
 
 var (
 	defaultRaftOptions = raftOptions{
 		ID:                         "Node",
+		BroadcastTimeout:           250 * time.Millisecond,
 		HeartbeatFrequency:         500 * time.Millisecond,
 		MaxElectionTimeout:         1000 * time.Millisecond,
 		MinElectionTimeout:         750 * time.Millisecond,
@@ -41,6 +44,12 @@ type RaftCallOption func(opt *raftOptions)
 func WithServerID(id string) RaftCallOption {
 	return func(opt *raftOptions) {
 		opt.ID = id
+	}
+}
+
+func WithBroadcastTimeout(broadcastTimeout time.Duration) RaftCallOption {
+	return func(opt *raftOptions) {
+		opt.BroadcastTimeout = broadcastTimeout
 	}
 }
 
@@ -912,9 +921,7 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 						responseChannel <- external_server.ClusterCreateResponse{
 							ClusterResponse: external_server.ClusterResponse{
 								StatusCode: external_server.Redirect,
-								Message: external_server.ClusterMessage{
-									LeaderName: clusterState.leaderName,
-								},
+								LeaderName: clusterState.leaderName,
 							},
 						}
 
@@ -938,9 +945,7 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 						responseChannel <- external_server.ClusterDeleteResponse{
 							ClusterResponse: external_server.ClusterResponse{
 								StatusCode: external_server.Redirect,
-								Message: external_server.ClusterMessage{
-									LeaderName: clusterState.leaderName,
-								},
+								LeaderName: clusterState.leaderName,
 							},
 						}
 
@@ -972,9 +977,7 @@ func (r *Raft) processClientRequests(done <-chan struct{}) <-chan struct{} {
 					responseChannel <- external_server.ClusterGetResponse{
 						ClusterResponse: external_server.ClusterResponse{
 							StatusCode: external_server.Redirect,
-							Message: external_server.ClusterMessage{
-								LeaderName: clusterState.leaderName,
-							},
+							LeaderName: clusterState.leaderName,
 						},
 					}
 
@@ -1037,6 +1040,7 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 			Key:     request.Key,
 			Payload: request.Value,
 			Term:    currentTerm,
+			Type:    pb.AppendEntriesRequest_CREATED,
 		},
 	}
 
@@ -1055,6 +1059,67 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 		LeaderCommit: commitIndex,
 		Entries:      newEntries,
 	}
+
+	return r.broadcastAppendEntriesRequest(ctx, clusterRequest)
+}
+
+func (r *Raft) processClientDeleteRequest(ctx context.Context, request *external_server.ClusterDeleteRequest) external_server.ClusterStatusCode {
+	logger := loggerFromContext(r.logger, ctx)
+
+	logger.Printf("received client delete request: %+v", request)
+
+	r.stateMutex.RLock()
+
+	// Check if we are still the leader
+	role := r.stateManager.GetRole()
+	if role != LEADER {
+		r.stateMutex.RUnlock()
+		logger.Errorf("unable to continue with processing client create request - not a leader")
+		return external_server.Redirect
+	}
+
+	// TODO: Maybe check the state machine with the SN of the request ?
+
+	previousLogIndex := r.logManager.GetLastLogIndex()
+	previousLogTerm := r.logManager.GetLastLogTerm()
+	currentTerm := r.stateManager.GetCurrentTerm()
+	commitIndex := r.stateManager.GetCommitIndex()
+
+	r.stateMutex.RUnlock()
+
+	newEntries := []*pb.AppendEntriesRequest_Entry{
+		&pb.AppendEntriesRequest_Entry{
+			Key:  request.Key,
+			Term: currentTerm,
+			Type: pb.AppendEntriesRequest_DELETED,
+		},
+	}
+
+	// Append client command to log
+	err := r.logManager.AppendEntries(newEntries)
+	if err != nil {
+		logger.Errorf("unable to append logs while processing client create request: %+v", err)
+		return external_server.FailedInternal
+	}
+
+	clusterRequest := &pb.AppendEntriesRequest{
+		Term:         currentTerm,
+		LeaderId:     r.settings.ID,
+		PrevLogIndex: previousLogIndex,
+		PrevLogTerm:  previousLogTerm,
+		LeaderCommit: commitIndex,
+		Entries:      newEntries,
+	}
+
+	return r.broadcastAppendEntriesRequest(ctx, clusterRequest)
+}
+
+func (r *Raft) broadcastAppendEntriesRequest(ctx context.Context, request *pb.AppendEntriesRequest) external_server.ClusterStatusCode {
+	logger := loggerFromContext(r.logger, ctx)
+
+	r.stateMutex.RLock()
+	currentTerm := r.stateManager.GetCurrentTerm()
+	r.stateMutex.RUnlock()
 
 	majorityReachedChannel := make(chan external_server.ClusterStatusCode)
 	go func() {
@@ -1077,7 +1142,7 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 					// Check if the terms match, see Figure 8 of the original paper
 					r.stateMutex.Lock()
 					if currentTerm == r.stateManager.GetCurrentTerm() {
-						nextLogIndex := previousLogIndex + uint64(len(newEntries))
+						nextLogIndex := request.GetPrevLogIndex() + uint64(len(request.GetEntries()))
 						r.commitLogsToStateMachine(ctxWithRequestID, r.stateManager.GetCommitIndex(), nextLogIndex)
 						r.stateManager.SetCommitIndex(nextLogIndex)
 					}
@@ -1086,10 +1151,10 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 			}
 		}
 
-		logger.Printf("sending AppendEntries request: %+v", clusterRequest)
+		logger.Printf("sending AppendEntries request: %+v", request)
 
-		requestCtx, cancel := context.WithCancel(ctxWithRequestID)
-		responses := r.cluster.BroadcastAppendEntriesRPCs(requestCtx, clusterRequest)
+		requestCtxWithTimeout, cancel := context.WithTimeout(ctxWithRequestID, r.settings.BroadcastTimeout)
+		responses := r.cluster.BroadcastAppendEntriesRPCs(requestCtxWithTimeout, request)
 		cancel()
 
 		var countOfAcceptedReplies uint32 = 1
@@ -1119,7 +1184,7 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 				nodeChannel := r.retryNodeAppendEntriesChannels[responseWrapper.NodeID]
 				nodeChannel <- &retryNodeAppendEntriesRequest{
 					Context:         ctxWithRequestID,
-					OriginalRequest: clusterRequest,
+					OriginalRequest: request,
 					SuccessCallback: successCallback,
 					FromError:       responseWrapper.Error,
 				}
@@ -1138,11 +1203,6 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 	}
 
 	return majorityReachedStatus
-}
-
-// TODO
-func (r *Raft) processClientDeleteRequest(ctx context.Context, request *external_server.ClusterDeleteRequest) external_server.ClusterStatusCode {
-	return external_server.Ok
 }
 
 func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-chan struct{} {
@@ -1306,8 +1366,9 @@ func (r *Raft) processClientGetRequest(ctx context.Context, request *external_se
 	}
 	r.stateMutex.RUnlock()
 
-	// TODO: The node might not be the leader (but doesn't know it)
+	// NOTE: The node might not be the leader (but doesn't know it)
 	// so that we might still get stale data
+	// Original paper describes mechanisms to avoit this situation
 	result, ok := r.stateMachine.Get(request.Key)
 	if !ok {
 		return nil, external_server.FailedNotFound
@@ -1339,7 +1400,14 @@ func (r *Raft) commitLogsToStateMachine(ctx context.Context, fromIndex uint64, t
 		logger.Debugf("log entries to commit: %+v", logEntriesToCommit)
 
 		for _, logEntryToCommit := range logEntriesToCommit {
-			r.stateMachine.Create(logEntryToCommit.GetKey(), logEntryToCommit.GetPayload())
+			switch logEntryToCommit.GetType() {
+			case pb.AppendEntriesRequest_CREATED:
+				r.stateMachine.Create(logEntryToCommit.GetKey(), logEntryToCommit.GetPayload())
+			case pb.AppendEntriesRequest_DELETED:
+				r.stateMachine.Delete(logEntryToCommit.GetKey())
+			default:
+				logger.Panicf("unknown log entry type: %+v", logEntryToCommit.GetType())
+			}
 		}
 	}
 }

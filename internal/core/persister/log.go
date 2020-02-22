@@ -15,13 +15,12 @@ import (
 )
 
 const (
-	// First DB Index - must be always empty
+	// First DB Index
 	firstLevelDBLogIndex = 0
 
 	// We will use lastLogDbKey to track which log entry is currently at the end.
 	// In case our node crashes, we just have to get the index inserted in
 	// lastLogDbKey and find the highest index present in the DB higher or equal to that.
-	// TODO: Maybe save it in a separate DB???
 	lastLogDbKey = firstLevelDBLogIndex
 )
 
@@ -44,14 +43,17 @@ type Entry struct {
 }
 
 type ILogEntryPersister interface {
-	// TODO: AppendLogs could maybe take []*CommandLog
 	AppendLogs(logs []*Entry) error
 	GetLastLog() *CommandLog
 	FindLogByIndex(index uint64) (*CommandLog, error)
+
+	// DeleteLogsAferIndex deletes logs after index, including the one at given index
 	DeleteLogsAferIndex(index uint64) error
+
+	// Replay replays all logs
 	Replay() (ILogEntryPersisterIterator, error)
 
-	// replay does [from,to] iteration
+	// ReplaySection does [from,to] iteration
 	ReplaySection(from uint64, to uint64) (ILogEntryPersisterIterator, error)
 	Close()
 }
@@ -85,6 +87,9 @@ func (numberComparer) Separator(dst, a, b []byte) []byte { return nil }
 func (numberComparer) Successor(dst, b []byte) []byte    { return nil }
 
 // LevelDBLogEntryPersister is safe for concurrent usage
+// We effectively disallow any parallelism in append and delete operations,
+// but we need to ensure that indexes allocated for logs will be without gaps
+// TODO: We might move control over indexing to the Raft part instead to solve this
 type LevelDBLogEntryPersister struct {
 	// leveldb.DB is safe for concurrent usage
 	db                 *leveldb.DB
@@ -287,10 +292,8 @@ func (l *LevelDBLogEntryPersister) DeleteLogsAferIndex(index uint64) error {
 	return nil
 }
 
-// TODO: Is holding locks necessary due to the possibility of concurrent DeleteLogsAferIndex?
 func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) {
 	l.lastCommandLogLock.RLock()
-	defer l.lastCommandLogLock.RUnlock()
 
 	var firstIndex uint64 = firstLevelDBLogIndex + uint64(1)
 	if l.lastCommandLog == nil {
@@ -299,19 +302,22 @@ func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) 
 
 	var lastIndex uint64 = l.lastCommandLog.Index
 
+	l.lastCommandLogLock.RUnlock()
+
+	// LevelDB iterator is guaranteed to be consistent
 	return l.replaySectionImpl(firstIndex, lastIndex)
 }
 
-// TODO: Is holding locks necessary due to the possibility of concurrent DeleteLogsAferIndex?
 func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uint64) (ILogEntryPersisterIterator, error) {
 	l.lastCommandLogLock.RLock()
-	defer l.lastCommandLogLock.RUnlock()
 
 	if l.lastCommandLog == nil {
 		return nil, ErrIndexedLogDoesNotExists
 	}
 
 	var lastIndex uint64 = l.lastCommandLog.Index
+
+	l.lastCommandLogLock.RUnlock()
 
 	if startIndex > endIndex {
 		return nil, ErrIncorrectIndexes
@@ -321,6 +327,7 @@ func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uin
 		return nil, ErrIncorrectIndexes
 	}
 
+	// LevelDB iterator is guaranteed to be consistent
 	return l.replaySectionImpl(startIndex, endIndex)
 }
 

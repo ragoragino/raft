@@ -58,9 +58,7 @@ func TestHandlersCreate(t *testing.T) {
 			clusterResponse: ClusterCreateResponse{
 				ClusterResponse: ClusterResponse{
 					StatusCode: Redirect,
-					Message: ClusterMessage{
-						LeaderName: "Node0",
-					},
+					LeaderName: "Node0",
 				},
 			},
 			expectedClusterRequest: &ClusterCreateRequest{
@@ -155,9 +153,7 @@ func TestHandlersGet(t *testing.T) {
 			clusterResponse: ClusterGetResponse{
 				ClusterResponse: ClusterResponse{
 					StatusCode: Redirect,
-					Message: ClusterMessage{
-						LeaderName: "Node0",
-					},
+					LeaderName: "Node0",
 				},
 			},
 			expectedClusterRequest: &ClusterGetRequest{
@@ -256,9 +252,7 @@ func TestHandlersDelete(t *testing.T) {
 			clusterResponse: ClusterDeleteResponse{
 				ClusterResponse: ClusterResponse{
 					StatusCode: Redirect,
-					Message: ClusterMessage{
-						LeaderName: "Node0",
-					},
+					LeaderName: "Node0",
 				},
 			},
 			expectedClusterRequest: &ClusterDeleteRequest{

@@ -40,6 +40,8 @@ func applyServerOptions(opts []ServerCallOption) *serverOptions {
 	return &options
 }
 
+// IClusterServer is an interface for servers used for internal communication
+// between Raft nodes
 type IClusterServer interface {
 	GetAppendEntriesChannel() (<-chan appendEntriesProcessRequest, error)
 	GetRequestVoteChannel() (<-chan requestVoteProcessRequest, error)

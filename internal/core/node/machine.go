@@ -2,6 +2,7 @@ package node
 
 import (
 	"encoding/json"
+	"fmt"
 	pb "raft/internal/core/node/gen"
 	"raft/internal/core/persister"
 	"sync"
@@ -9,6 +10,9 @@ import (
 	logrus "github.com/sirupsen/logrus"
 )
 
+// IStateMachine defines the interface for state machine.
+// State machine should be used to gather appended log entries and
+// contacted when an external client queries a particular key.
 type IStateMachine interface {
 	Create(key string, value []byte)
 	Get(key string) ([]byte, bool)
@@ -37,8 +41,9 @@ func (sm *StateMachine) Create(key string, value []byte) {
 
 func (sm *StateMachine) Get(key string) ([]byte, bool) {
 	sm.stateMutex.RLock()
-	defer sm.stateMutex.RUnlock()
 	value, ok := sm.state[key]
+	sm.stateMutex.RUnlock()
+
 	return value, ok
 }
 
@@ -51,14 +56,21 @@ func (sm *StateMachine) Delete(key string) {
 func (sm *StateMachine) LoadState(writeChannel <-chan persister.CommandLog) error {
 	sm.stateMutex.RLock()
 	defer sm.stateMutex.RUnlock()
-	for log := range writeChannel {
-		clientLogMarshalled := pb.AppendEntriesRequest_Entry{}
-		err := json.Unmarshal(log.Command, &clientLogMarshalled)
+	for commandLog := range writeChannel {
+		logEntry := pb.AppendEntriesRequest_Entry{}
+		err := json.Unmarshal(commandLog.Command, &logEntry)
 		if err != nil {
 			return err
 		}
 
-		sm.state[clientLogMarshalled.Key] = clientLogMarshalled.GetPayload()
+		switch logEntry.GetType() {
+		case pb.AppendEntriesRequest_CREATED:
+			sm.state[logEntry.GetKey()] = logEntry.GetPayload()
+		case pb.AppendEntriesRequest_DELETED:
+			delete(sm.state, logEntry.GetKey())
+		default:
+			return fmt.Errorf("unknown log entry type: %+v", logEntry.GetType())
+		}
 	}
 
 	return nil

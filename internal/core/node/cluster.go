@@ -3,24 +3,30 @@ package node
 import (
 	"context"
 	"fmt"
-	"google.golang.org/grpc/metadata"
 	"math/rand"
 	pb "raft/internal/core/node/gen"
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	logrus "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
-	grpc_backoff "google.golang.org/grpc/backoff"
+	grpc_codes "google.golang.org/grpc/codes"
 )
 
 type clusterOptions struct {
 	connectionDialTimeout time.Duration
+	maxRetries            uint
 }
 
 var (
 	defaultClusterOptions = clusterOptions{
 		connectionDialTimeout: 15 * time.Second,
+		maxRetries:            5,
 	}
 )
 
@@ -29,6 +35,12 @@ type ClusterCallOption func(opt *clusterOptions)
 func WithConnectionDialTimeout(timeout time.Duration) ClusterCallOption {
 	return func(opt *clusterOptions) {
 		opt.connectionDialTimeout = timeout
+	}
+}
+
+func WithMaxRetries(maxRetries uint) ClusterCallOption {
+	return func(opt *clusterOptions) {
+		opt.maxRetries = maxRetries
 	}
 }
 
@@ -53,6 +65,7 @@ type AppendEntriesResponseWrapper struct {
 	NodeID   string
 }
 
+// ICluster provides interface for client internal communcation with Raft nodes
 type ICluster interface {
 	StartCluster(otherNodes map[string]string) error
 	Close()
@@ -72,21 +85,17 @@ type NodeInfo struct {
 }
 
 type Cluster struct {
-	logger                      *logrus.Entry
-	nodes                       []*NodeInfo
-	leader                      *NodeInfo
-	leaderMutex                 sync.RWMutex
-	settings                    *clusterOptions
-	exponentialBackofferFactory ExponentialBackofferFactory
+	logger *logrus.Entry
 
-	closeOnce sync.Once
+	// TODO: Does it make sense to optimize this to map?
+	nodes       []*NodeInfo
+	leader      *NodeInfo
+	leaderMutex sync.RWMutex
+	settings    *clusterOptions
 }
 
 func NewCluster(logger *logrus.Entry, opts ...ClusterCallOption) *Cluster {
 	return &Cluster{
-		exponentialBackofferFactory: ExponentialBackofferFactory{
-			grpc_backoff.DefaultConfig,
-		},
 		logger:   logger,
 		settings: applyClusterOptions(opts),
 	}
@@ -103,8 +112,18 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 	defer cancel()
 
 	for name, endpoint := range otherNodes {
-		conn, err := grpc.DialContext(ctx, endpoint, grpc.WithInsecure(), grpc.WithAuthority(endpoint),
-			grpc.WithBlock(), grpc.WithUnaryInterceptor(metadataSettingInterceptor))
+		grpc_retry_options := []grpc_retry.CallOption{
+			grpc_retry.WithMax(c.settings.maxRetries),
+		}
+
+		conn, err := grpc.DialContext(ctx, endpoint,
+			grpc.WithInsecure(),
+			grpc.WithAuthority(endpoint),
+			grpc.WithBlock(),
+			grpc.WithUnaryInterceptor(
+				grpc_middleware.ChainUnaryClient(metadataSettingInterceptor,
+					grpc_retry.UnaryClientInterceptor(grpc_retry_options...),
+				)))
 		if err != nil {
 			for _, node := range nodes {
 				err := node.connection.Close()
@@ -129,17 +148,16 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 	return nil
 }
 
+// Close should be called only once
 func (c *Cluster) Close() {
-	c.closeOnce.Do(func() {
-		c.logger.Errorf("closing cluster connections")
+	c.logger.Errorf("closing cluster client connections")
 
-		for _, node := range c.nodes {
-			err := node.connection.Close()
-			if err != nil {
-				logrus.Errorf("unable to close a connection for node: %s: %+v", node.name, err)
-			}
+	for _, node := range c.nodes {
+		err := node.connection.Close()
+		if err != nil {
+			logrus.Errorf("unable to close a connection for node: %s: %+v", node.name, err)
 		}
-	})
+	}
 }
 
 func (c *Cluster) GetClusterState() ClusterState {
@@ -185,10 +203,10 @@ func (c *Cluster) SetLeader(leaderName string) error {
 	return fmt.Errorf("leader with this name was not found in the list of nodes: %s", leaderName)
 }
 
+// SendAppendEntries retries RPC AppendEntries to the given server until it receives a valid response
 func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	var destinationNode *NodeInfo
 
-	// TODO: Does it make sense to optimize this to map?
 	for _, node := range c.nodes {
 		if node.name == nodeID {
 			destinationNode = node
@@ -199,9 +217,8 @@ func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request 
 		return nil, fmt.Errorf("unable to find node %s in a slice of nodes: %+v", nodeID, c.nodes)
 	}
 
-	backoffer := c.exponentialBackofferFactory.NewExponentialBackoffer()
 	for {
-		c.logger.Debugf("sending RPC AppendEntries to client %s for the %d time", nodeID, backoffer.retries)
+		c.logger.Debugf("sending RPC AppendEntries to client %s", nodeID)
 
 		resp, err := destinationNode.client.AppendEntries(ctx, request)
 
@@ -209,23 +226,22 @@ func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request 
 
 		if err == nil {
 			return resp, nil
-		} else if err == context.Canceled || err == context.DeadlineExceeded {
+		} else if st, ok := status.FromError(err); ok && st.Code() == grpc_codes.Canceled || st.Code() == grpc_codes.DeadlineExceeded {
 			return nil, err
+		} else {
+			c.logger.Errorf("sending RPC AppendEntries to client %s failed with error: %+v", nodeID, err)
 		}
-
-		time.Sleep(backoffer.Do())
 	}
 }
 
 func (c *Cluster) BroadcastRequestVoteRPCs(ctx context.Context, request *pb.RequestVoteRequest) []*pb.RequestVoteResponse {
-	responses := make([]*pb.RequestVoteResponse, 0, len(c.nodes))
-	responseChannel := make(chan *pb.RequestVoteResponse, len(c.nodes))
+	responses := make([]*pb.RequestVoteResponse, len(c.nodes))
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(c.nodes))
 
-	for _, node := range c.nodes {
-		go func(node *NodeInfo) {
+	for i, node := range c.nodes {
+		go func(i int, node *NodeInfo) {
 			defer wg.Done()
 
 			c.logger.Debugf("sending RPC RequestVote to client: %s", node.name)
@@ -238,16 +254,11 @@ func (c *Cluster) BroadcastRequestVoteRPCs(ctx context.Context, request *pb.Requ
 
 			c.logger.Debugf("received response from RPC RequestVote %+v from client: %s", resp, node.name)
 
-			responseChannel <- resp
-		}(node)
+			responses[i] = resp
+		}(i, node)
 	}
 
 	wg.Wait()
-	close(responseChannel)
-
-	for resp := range responseChannel {
-		responses = append(responses, resp)
-	}
 
 	return responses
 }
@@ -264,7 +275,6 @@ func (c *Cluster) BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.Ap
 
 			c.logger.Debugf("sending RPC AppendEntries to client %s: %+v", node.name, request)
 
-			// TODO: Retry policy
 			resp, err := node.client.AppendEntries(ctx, request)
 
 			c.logger.Debugf("received response from RPC AppendEntries %+v and error %+v from client: %s", resp, err, node.name)
@@ -280,51 +290,6 @@ func (c *Cluster) BroadcastAppendEntriesRPCs(ctx context.Context, request *pb.Ap
 	wg.Wait()
 
 	return responses
-}
-
-type ExponentialBackofferFactory struct {
-	config grpc_backoff.Config
-}
-
-func (ebf *ExponentialBackofferFactory) NewExponentialBackoffer() *ExpontialBackoffer {
-	return &ExpontialBackoffer{
-		config:  ebf.config,
-		retries: 0,
-	}
-}
-
-type ExpontialBackoffer struct {
-	config  grpc_backoff.Config
-	retries int
-}
-
-func (eb *ExpontialBackoffer) Do() time.Duration {
-	defer func() {
-		eb.retries++
-	}()
-
-	if eb.retries == 0 {
-		return eb.config.BaseDelay
-	}
-
-	retries := eb.retries
-	backoff, max := float64(eb.config.BaseDelay), float64(eb.config.MaxDelay)
-	for backoff < max && retries > 0 {
-		backoff *= eb.config.Multiplier
-		retries--
-	}
-
-	if backoff > max {
-		return eb.config.MaxDelay
-	}
-
-	// Add random jitter to the backoff
-	backoff *= 1 + eb.config.Jitter*(rand.Float64()*2-1)
-	if backoff < 0 {
-		return 0
-	}
-
-	return time.Duration(backoff)
 }
 
 func metadataSettingInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {

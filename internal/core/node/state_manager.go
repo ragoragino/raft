@@ -1,9 +1,10 @@
 package node
 
 import (
-	"github.com/google/uuid"
-	logrus "github.com/sirupsen/logrus"
+	"fmt"
 	"raft/internal/core/persister"
+
+	"github.com/google/uuid"
 )
 
 type PersistentStateInfo struct {
@@ -22,6 +23,7 @@ type StateSwitched struct {
 	newState PersistentStateInfo
 }
 
+// IStateManager provides interface for managing Raft state variables
 type IStateManager interface {
 	AddPersistentStateObserver(handler chan StateSwitched) string
 	RemovePersistentStateObserver(id string)
@@ -66,7 +68,7 @@ func NewStateManager(stateInfo PersistentStateInfo, volatileInfo VolatileStateIn
 func (s *StateManager) AddPersistentStateObserver(handler chan StateSwitched) string {
 	id, err := uuid.NewUUID()
 	if err != nil {
-		logrus.Panicf("unable to create new uuid: %+v", err)
+		panic(fmt.Sprintf("unable to create new uuid: %+v", err))
 	}
 
 	idStr := id.String()

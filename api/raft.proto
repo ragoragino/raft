@@ -10,10 +10,17 @@ service Node {
 }
 
 message AppendEntriesRequest {
+  enum EntryType
+  {
+    CREATED = 0;
+    DELETED = 1;
+  }
+
   message Entry {
     string key = 1;
     bytes payload = 2;
     uint64 term = 3;
+    EntryType type = 4;
   }
 
   uint64 term = 1;
