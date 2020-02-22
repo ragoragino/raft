@@ -8,7 +8,7 @@ import (
 	"github.com/golang/protobuf/proto"
 )
 
-// IStateManager provides interface for managing Raft persistent logs
+// ILogEntryManager provides interface for managing Raft persistent logs
 type ILogEntryManager interface {
 	GetLastLogIndex() uint64
 	GetLastLogTerm() uint64

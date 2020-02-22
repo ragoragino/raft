@@ -42,6 +42,8 @@ type Entry struct {
 	Command []byte `json:"Command"`
 }
 
+// ILogEntryPersister provides interface for persisting logs entries
+// It saves logs by the given index (should be higher or equal to 1)
 type ILogEntryPersister interface {
 	AppendLogs(logs []*Entry) error
 	GetLastLog() *CommandLog

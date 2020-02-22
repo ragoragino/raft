@@ -190,10 +190,10 @@ func NewRaft(logger *logrus.Entry, stateManager IStateManager, logManager ILogEn
 	return raft
 }
 
-func (r *Raft) Run() {
+func (r *Raft) Run() error {
 	err := r.loadInitialState()
 	if err != nil {
-		r.logger.Errorf("WRRRONNNNG!: %+v", err)
+		return err
 	}
 
 	clusterState := r.cluster.GetClusterState()
@@ -278,6 +278,8 @@ handlerLoop:
 
 	// Signal end of the Raft engine closing
 	close(r.runFinishedChannel)
+
+	return nil
 }
 
 // No locks are held here, because it should be called before

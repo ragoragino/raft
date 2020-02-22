@@ -183,11 +183,11 @@ func startRaftEngines(t *testing.T, rafts map[string]*Raft) *sync.WaitGroup {
 	for _, raft := range rafts {
 		go func(raft *Raft) {
 			defer wgRaft.Done()
-			raft.Run()
-			/*			if err != nil {
-						fmt.Printf("running raft engine failed: %+v", err)
-						t.FailNow()
-					}*/
+			err := raft.Run()
+			if err != nil {
+				fmt.Printf("running raft engine failed: %+v", err)
+				t.FailNow()
+			}
 		}(raft)
 	}
 

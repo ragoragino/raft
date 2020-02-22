@@ -126,7 +126,10 @@ func main() {
 	wgRaftEngine.Add(1)
 	go func(raft *raft_node.Raft) {
 		defer wgRaftEngine.Done()
-		raft.Run()
+		err := raft.Run()
+		if err != nil {
+			logger.Panicf("running raft engine failed: %+v", err)
+		}
 	}(raftEngine)
 
 	// Start HTTP server
@@ -144,11 +147,6 @@ func main() {
 	time.Sleep(30 * time.Second)
 
 	// Close servers, Raft instances and cluster clients down
-	err = httpServer.Shutdown(context.Background())
-	if err != nil {
-		logger.Errorf("unable to shutdown HTTP server: %+v", err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
