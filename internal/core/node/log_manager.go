@@ -15,6 +15,7 @@ type ILogEntryManager interface {
 	FindTermAtIndex(index uint64) (uint64, error)
 	FindEntryAtIndex(index uint64) (*pb.AppendEntriesRequest_Entry, error)
 	AppendEntries(entries []*pb.AppendEntriesRequest_Entry) error
+	ReplayEntries() (persister.ILogEntryPersisterIterator, error)
 
 	// GetEntriesBetweenIndexes gets all objects in the range (startIndex, endIndex]
 	GetEntriesBetweenIndexes(startIndex uint64, endIndex uint64) ([]*pb.AppendEntriesRequest_Entry, error)
@@ -124,4 +125,8 @@ func (l *LogEntryManager) GetEntriesBetweenIndexes(startIndex uint64, endIndex u
 
 	iterator.Close()
 	return entries, iterator.Error()
+}
+
+func (l *LogEntryManager) ReplayEntries() (persister.ILogEntryPersisterIterator, error) {
+	return l.entryPersister.Replay()
 }

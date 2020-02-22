@@ -297,7 +297,8 @@ func (l *LevelDBLogEntryPersister) Replay() (ILogEntryPersisterIterator, error) 
 
 	var firstIndex uint64 = firstLevelDBLogIndex + uint64(1)
 	if l.lastCommandLog == nil {
-		return nil, ErrIndexedLogDoesNotExists
+		l.lastCommandLogLock.RUnlock()
+		return nil, ErrDatabaseEmpty
 	}
 
 	var lastIndex uint64 = l.lastCommandLog.Index
@@ -312,7 +313,8 @@ func (l *LevelDBLogEntryPersister) ReplaySection(startIndex uint64, endIndex uin
 	l.lastCommandLogLock.RLock()
 
 	if l.lastCommandLog == nil {
-		return nil, ErrIndexedLogDoesNotExists
+		l.lastCommandLogLock.RUnlock()
+		return nil, ErrDatabaseEmpty
 	}
 
 	var lastIndex uint64 = l.lastCommandLog.Index

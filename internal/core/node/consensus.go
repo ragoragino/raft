@@ -191,6 +191,11 @@ func NewRaft(logger *logrus.Entry, stateManager IStateManager, logManager ILogEn
 }
 
 func (r *Raft) Run() {
+	err := r.loadInitialState()
+	if err != nil {
+		r.logger.Errorf("WRRRONNNNG!: %+v", err)
+	}
+
 	clusterState := r.cluster.GetClusterState()
 	endRetryNodeAppendEntriesChannel := make(map[string]<-chan struct{}, len(clusterState.nodes))
 	r.retryNodeAppendEntriesChannels = make(map[string]chan *retryNodeAppendEntriesRequest, len(clusterState.nodes))
@@ -273,6 +278,26 @@ handlerLoop:
 
 	// Signal end of the Raft engine closing
 	close(r.runFinishedChannel)
+}
+
+// No locks are held here, because it should be called before
+// the initialization of processor routines
+func (r *Raft) loadInitialState() error {
+	iterator, err := r.logManager.ReplayEntries()
+	if err == persister.ErrDatabaseEmpty {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	err = r.stateMachine.LoadState(iterator)
+	if err != nil {
+		return err
+	}
+
+	r.stateManager.SetCommitIndex(r.logManager.GetLastLogIndex())
+
+	return nil
 }
 
 func (r *Raft) observeStateChanges(doneChannel <-chan struct{}, currentRole RaftRole) (<-chan RaftRole, <-chan struct{}) {

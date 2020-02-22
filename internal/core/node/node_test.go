@@ -36,14 +36,6 @@ var (
 	timeToReplicateMessage        = avgNetworkRoundTripTime
 )
 
-var (
-	startingStateInfo = PersistentStateInfo{
-		CurrentTerm: 0,
-		VotedFor:    nil,
-		Role:        FOLLOWER,
-	}
-)
-
 func initializeStatePersister(t *testing.T, logger *logrus.Entry, fileStatePath string) (persister.IStateLogger, func()) {
 	fileStatePersister := persister.NewLevelDBStateLogger(logger, fileStatePath)
 
@@ -131,17 +123,7 @@ func constructClusterComponents(t *testing.T,
 			initializeLogEntryPersister(t, logEntryPersisterLogger, fileLogPath)
 		cleanerFuncs = append(cleanerFuncs, fileLogLoggerClean)
 
-		matchIndex := map[string]uint64{}
-		for name := range endpoints {
-			matchIndex[name] = 0
-		}
-
-		startingVolatileInfo := VolatileStateInfo{
-			CommitIndex: 0,
-			MatchIndex:  matchIndex,
-		}
-
-		stateHandler := NewStateManager(startingStateInfo, startingVolatileInfo, fileStateLogger)
+		stateHandler := NewStateManager(fileStateLogger)
 		logHandler := NewLogEntryManager(fileLogLogger)
 
 		stateMachineLogger := logger.WithFields(logrus.Fields{
@@ -195,13 +177,17 @@ func startClusterClients(t *testing.T, clusterClients map[string]*Cluster, endpo
 	}
 }
 
-func startRaftEngines(rafts map[string]*Raft) *sync.WaitGroup {
+func startRaftEngines(t *testing.T, rafts map[string]*Raft) *sync.WaitGroup {
 	wgRaft := sync.WaitGroup{}
 	wgRaft.Add(len(rafts))
 	for _, raft := range rafts {
 		go func(raft *Raft) {
 			defer wgRaft.Done()
 			raft.Run()
+			/*			if err != nil {
+						fmt.Printf("running raft engine failed: %+v", err)
+						t.FailNow()
+					}*/
 		}(raft)
 	}
 
@@ -252,7 +238,7 @@ func TestLeaderElected(t *testing.T) {
 
 	startClusterClients(t, clusterClients, endpoints)
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
 	// Check if leader was elected
 	time.Sleep(timeToElectLeader)
@@ -378,7 +364,7 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
 	// Check if leader was elected
 	time.Sleep(timeToElectLeader)
@@ -479,7 +465,7 @@ func TestCreateGetAndDeleteDocuments(t *testing.T) {
 
 	startClusterClients(t, clusterClients, endpoints)
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
 	wgHTTP := startHTTPServer(t, httpServers)
 
@@ -742,7 +728,7 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
 	wgHTTP := startHTTPServer(t, httpServers)
 
@@ -917,7 +903,7 @@ func TestContinuousTraffic(t *testing.T) {
 
 	startClusterClients(t, clusterClients, endpoints)
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
 	wgHTTP := startHTTPServer(t, httpServers)
 

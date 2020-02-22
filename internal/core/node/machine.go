@@ -17,7 +17,7 @@ type IStateMachine interface {
 	Create(key string, value []byte)
 	Get(key string) ([]byte, bool)
 	Delete(key string)
-	LoadState(writeChannel <-chan persister.CommandLog) error
+	LoadState(iterator persister.ILogEntryPersisterIterator) error
 }
 
 type StateMachine struct {
@@ -53,10 +53,13 @@ func (sm *StateMachine) Delete(key string) {
 	sm.stateMutex.Unlock()
 }
 
-func (sm *StateMachine) LoadState(writeChannel <-chan persister.CommandLog) error {
+func (sm *StateMachine) LoadState(iterator persister.ILogEntryPersisterIterator) error {
 	sm.stateMutex.RLock()
 	defer sm.stateMutex.RUnlock()
-	for commandLog := range writeChannel {
+
+	for iterator.Next() {
+		commandLog := iterator.Value()
+
 		logEntry := pb.AppendEntriesRequest_Entry{}
 		err := json.Unmarshal(commandLog.Command, &logEntry)
 		if err != nil {
@@ -73,5 +76,5 @@ func (sm *StateMachine) LoadState(writeChannel <-chan persister.CommandLog) erro
 		}
 	}
 
-	return nil
+	return iterator.Error()
 }
