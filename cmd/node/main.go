@@ -94,7 +94,6 @@ func main() {
 	// Initialize HTTP Server
 	// TODO: We could write a manager service that will spawn the cluster and
 	// dynamically route requests to the leader based on redirect responses
-	// That is why we put just names instead of HTTP endpoints
 	HTTPEndpoints := map[string]string{}
 	for name, endpoint := range opts.OtherNamedHTTPEndpoints {
 		HTTPEndpoints[name] = endpoint

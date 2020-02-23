@@ -28,7 +28,7 @@ import (
 // so writing proper unit tests could be helpful
 
 var (
-	conservativeBulgarianConstant = 2 // includes mainly the time of toxiproxy reenabling rules
+	conservativeBulgarianConstant = 2
 	avgNetworkRoundTripTime       = 5 * time.Millisecond
 	timeToRestartProxy            = 5 * time.Second
 	maxNetworkRoundtripTime       = defaultRaftOptions.BroadcastTimeout
@@ -153,7 +153,7 @@ func startClusterServers(t *testing.T, clusterServers map[string]*ClusterServer)
 			defer wgServer.Done()
 			err := clusterServer.Run()
 			if err != nil {
-				fmt.Printf("running cluster server failed: %+v", err)
+				t.Logf("running cluster server failed: %+v", err)
 				t.FailNow()
 			}
 		}(clusterServer)
@@ -185,7 +185,7 @@ func startRaftEngines(t *testing.T, rafts map[string]*Raft) *sync.WaitGroup {
 			defer wgRaft.Done()
 			err := raft.Run()
 			if err != nil {
-				fmt.Printf("running raft engine failed: %+v", err)
+				t.Logf("running raft engine failed: %+v", err)
 				t.FailNow()
 			}
 		}(raft)
@@ -202,7 +202,7 @@ func startHTTPServer(t *testing.T, httpServers map[string]external_server.Interf
 			defer wgHTTP.Done()
 			err := server.Run()
 			if err != nil {
-				fmt.Printf("running http server failed: %+v", err)
+				t.Logf("running http server failed: %+v", err)
 				t.FailNow()
 			}
 		}(httpServer)

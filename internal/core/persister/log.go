@@ -43,7 +43,8 @@ type Entry struct {
 }
 
 // ILogEntryPersister provides interface for persisting logs entries
-// It saves logs by the given index (should be higher or equal to 1)
+// TODO: It saves logs starting from index 1 -> should be corrected to give
+// more options to the client
 type ILogEntryPersister interface {
 	AppendLogs(logs []*Entry) error
 	GetLastLog() *CommandLog
