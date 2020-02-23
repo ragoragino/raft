@@ -108,7 +108,7 @@ func constructClusterComponents(t *testing.T,
 			"node":      name,
 		})
 
-		fileStatePath := fmt.Sprintf("db_node_test_%s_State_%s.txt", t.Name(), name)
+		fileStatePath := fmt.Sprintf("db_node_test_%s_State_%s", t.Name(), name)
 		fileStateLogger, fileStateLoggerClean :=
 			initializeStatePersister(t, statePersisterLogger, fileStatePath)
 		cleanerFuncs = append(cleanerFuncs, fileStateLoggerClean)
@@ -118,7 +118,7 @@ func constructClusterComponents(t *testing.T,
 			"node":      name,
 		})
 
-		fileLogPath := fmt.Sprintf("db_node_test_%s_Log_%s.txt", t.Name(), name)
+		fileLogPath := fmt.Sprintf("db_node_test_%s_Log_%s", t.Name(), name)
 		fileLogLogger, fileLogLoggerClean :=
 			initializeLogEntryPersister(t, logEntryPersisterLogger, fileLogPath)
 		cleanerFuncs = append(cleanerFuncs, fileLogLoggerClean)

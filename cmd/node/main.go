@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"os"
+	"os/signal"
 	raft_node "raft/internal/core/node"
 	"raft/internal/core/persister"
 	http_server "raft/internal/core/server"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jessevdk/go-flags"
@@ -31,6 +34,11 @@ var opts struct {
 }
 
 func main() {
+	interruptChannel := make(chan os.Signal, 1)
+	signal.Notify(interruptChannel,
+		syscall.SIGINT,
+		syscall.SIGTERM)
+
 	logrus.SetLevel(logrus.DebugLevel)
 
 	logger := logrus.StandardLogger()
@@ -61,7 +69,7 @@ func main() {
 		"component": "LevelDBStatePersister",
 	})
 
-	fileStatePath := "db_node_State.txt"
+	fileStatePath := "db_node_State"
 	fileStatePersister := persister.NewLevelDBStateLogger(statePersisterLogger, fileStatePath)
 	defer fileStatePersister.Close()
 
@@ -70,7 +78,7 @@ func main() {
 		"component": "LevelDBLogPersister",
 	})
 
-	fileLogPath := "db_node_Log.txt"
+	fileLogPath := "db_node_Log"
 	fileLogEntryPersister := persister.NewLevelDBLogEntryPersister(logEntryPersisterLogger, fileLogPath)
 	defer fileLogEntryPersister.Close()
 
@@ -88,8 +96,8 @@ func main() {
 	// dynamically route requests to the leader based on redirect responses
 	// That is why we put just names instead of HTTP endpoints
 	HTTPEndpoints := map[string]string{}
-	for name := range opts.OtherNamedEndpoints {
-		HTTPEndpoints[name] = name
+	for name, endpoint := range opts.OtherNamedHTTPEndpoints {
+		HTTPEndpoints[name] = endpoint
 	}
 	externalServerLogger := logger.WithFields(logrus.Fields{
 		"component": "httpServer",
@@ -107,13 +115,13 @@ func main() {
 	// Start cluster server
 	wgClusterServer := sync.WaitGroup{}
 	wgClusterServer.Add(1)
-	go func(clusterServer *raft_node.ClusterServer) {
+	go func() {
 		defer wgClusterServer.Done()
-		err := clusterServer.Run()
+		err := raftClusterServer.Run()
 		if err != nil {
 			logger.Panicf("running cluster server failed: %+v", err)
 		}
-	}(raftClusterServer)
+	}()
 
 	// Start cluster client
 	err = raftClusterClient.StartCluster(opts.OtherNamedEndpoints)
@@ -124,27 +132,27 @@ func main() {
 	// Start Raft engine
 	wgRaftEngine := sync.WaitGroup{}
 	wgRaftEngine.Add(1)
-	go func(raft *raft_node.Raft) {
+	go func() {
 		defer wgRaftEngine.Done()
-		err := raft.Run()
+		err := raftEngine.Run()
 		if err != nil {
 			logger.Panicf("running raft engine failed: %+v", err)
 		}
-	}(raftEngine)
+	}()
 
 	// Start HTTP server
 	wgHTTPServer := sync.WaitGroup{}
 	wgHTTPServer.Add(1)
-	go func(server http_server.Interface) {
+	go func() {
 		defer wgHTTPServer.Done()
-		err := server.Run()
+		err := httpServer.Run()
 		if err != nil {
 			logger.Panicf("running http server failed: %+v", err)
 		}
-	}(httpServer)
+	}()
 
 	// Now, the cluster should be running
-	time.Sleep(30 * time.Second)
+	<-interruptChannel
 
 	// Close servers, Raft instances and cluster clients down
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -112,6 +112,7 @@ func (c *Cluster) StartCluster(otherNodes map[string]string) error {
 	defer cancel()
 
 	for name, endpoint := range otherNodes {
+		// TODO: make dial async?
 		grpc_retry_options := []grpc_retry.CallOption{
 			grpc_retry.WithMax(c.settings.maxRetries),
 		}
@@ -204,6 +205,7 @@ func (c *Cluster) SetLeader(leaderName string) error {
 }
 
 // SendAppendEntries retries RPC AppendEntries to the given server until it receives a valid response
+// In case context is canceled or its deadline is exceeded, it returns appropiate context errors
 func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	var destinationNode *NodeInfo
 
@@ -226,11 +228,15 @@ func (c *Cluster) SendAppendEntries(ctx context.Context, nodeID string, request 
 
 		if err == nil {
 			return resp, nil
-		} else if st, ok := status.FromError(err); ok && st.Code() == grpc_codes.Canceled || st.Code() == grpc_codes.DeadlineExceeded {
-			return nil, err
-		} else {
-			c.logger.Errorf("sending RPC AppendEntries to client %s failed with error: %+v", nodeID, err)
+		} else if st, ok := status.FromError(err); ok {
+			if st.Code() == grpc_codes.Canceled {
+				return nil, context.Canceled
+			} else if st.Code() == grpc_codes.DeadlineExceeded {
+				return nil, context.DeadlineExceeded
+			}
 		}
+
+		c.logger.Errorf("sending RPC AppendEntries to client %s failed with error: %+v", nodeID, err)
 	}
 }
 

@@ -1,12 +1,12 @@
 package node
 
 import (
-	"encoding/json"
 	"fmt"
 	pb "raft/internal/core/node/gen"
 	"raft/internal/core/persister"
 	"sync"
 
+	"github.com/golang/protobuf/proto"
 	logrus "github.com/sirupsen/logrus"
 )
 
@@ -61,8 +61,9 @@ func (sm *StateMachine) LoadState(iterator persister.ILogEntryPersisterIterator)
 		commandLog := iterator.Value()
 
 		logEntry := pb.AppendEntriesRequest_Entry{}
-		err := json.Unmarshal(commandLog.Command, &logEntry)
+		err := proto.Unmarshal(commandLog.Command, &logEntry)
 		if err != nil {
+			sm.logger.Printf("value: %s", commandLog.Command)
 			return err
 		}
 
