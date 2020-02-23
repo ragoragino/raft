@@ -12,9 +12,6 @@ import (
 	logrus "github.com/sirupsen/logrus"
 )
 
-// Structs are separate for client and cluster because one day
-// we might add some optional arguments to either one
-
 type ClientCreateRequest struct {
 	Key   string
 	Value []byte
@@ -44,37 +41,33 @@ const (
 	RequestIDKey = "id"
 )
 
-type ClusterMessage struct {
-	Error      error
-	LeaderName string
-}
-
-type ClusterRequest struct {
+type clusterRequest struct {
 	Context context.Context
 }
 
 type ClusterCreateRequest struct {
-	ClusterRequest
+	clusterRequest
 	Key             string
 	Value           []byte
 	ResponseChannel chan<- ClusterCreateResponse
 }
 
 type ClusterGetRequest struct {
-	ClusterRequest
+	clusterRequest
 	Key             string
 	ResponseChannel chan<- ClusterGetResponse
 }
 
 type ClusterDeleteRequest struct {
-	ClusterRequest
+	clusterRequest
 	Key             string
 	ResponseChannel chan<- ClusterDeleteResponse
 }
 
 type ClusterResponse struct {
 	StatusCode ClusterStatusCode
-	Message    ClusterMessage
+	Error      error
+	LeaderName string
 }
 
 type ClusterCreateResponse struct {
@@ -199,7 +192,7 @@ func (s *ExternalServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	responseChannel := make(chan ClusterCreateResponse)
 	s.requestsChannelsPub.ClusterCreateRequestChan <- ClusterCreateRequest{
-		ClusterRequest:  ClusterRequest{Context: ctx},
+		clusterRequest:  clusterRequest{Context: ctx},
 		Key:             clientRequest.Key,
 		Value:           clientRequest.Value,
 		ResponseChannel: responseChannel,
@@ -215,10 +208,10 @@ func (s *ExternalServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	case Redirect:
-		leaderAddress, ok := s.nodesEndpoints[clusterResponse.Message.LeaderName]
+		leaderAddress, ok := s.nodesEndpoints[clusterResponse.LeaderName]
 		if !ok {
 			s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
-				clusterResponse.Message.LeaderName, s.nodesEndpoints)
+				clusterResponse.LeaderName, s.nodesEndpoints)
 		}
 
 		// Return StatusTemporaryRedirect, as only 307 and 308 statuses
@@ -241,7 +234,7 @@ func (s *ExternalServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	responseChannel := make(chan ClusterDeleteResponse)
 	s.requestsChannelsPub.ClusterDeleteRequestChan <- ClusterDeleteRequest{
-		ClusterRequest:  ClusterRequest{Context: ctx},
+		clusterRequest:  clusterRequest{Context: ctx},
 		Key:             clientRequest.Key,
 		ResponseChannel: responseChannel,
 	}
@@ -259,15 +252,15 @@ func (s *ExternalServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	case Redirect:
-		leaderAddress, ok := s.nodesEndpoints[clusterResponse.Message.LeaderName]
+		leaderAddress, ok := s.nodesEndpoints[clusterResponse.LeaderName]
 		if !ok {
 			s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
-				clusterResponse.Message.LeaderName, s.nodesEndpoints)
+				clusterResponse.LeaderName, s.nodesEndpoints)
 		}
 
 		// Return StatusTemporaryRedirect, as only 307 and 308 statuses
 		// force http clients to follow redirects with the same methods
-		endpoint := "http://" + leaderAddress + "/get"
+		endpoint := "http://" + leaderAddress + "/delete"
 		http.Redirect(w, r, endpoint, http.StatusTemporaryRedirect)
 		return
 	}
@@ -285,7 +278,7 @@ func (s *ExternalServer) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	responseChannel := make(chan ClusterGetResponse)
 	s.requestsChannelsPub.ClusterGetRequestChan <- ClusterGetRequest{
-		ClusterRequest:  ClusterRequest{Context: ctx},
+		clusterRequest:  clusterRequest{Context: ctx},
 		Key:             clientRequest.Key,
 		ResponseChannel: responseChannel,
 	}
@@ -312,10 +305,10 @@ func (s *ExternalServer) handleGet(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	case Redirect:
-		leaderAddress, ok := s.nodesEndpoints[clusterResponse.Message.LeaderName]
+		leaderAddress, ok := s.nodesEndpoints[clusterResponse.LeaderName]
 		if !ok {
 			s.logger.Panicf("unable to get address of the leader %s in endpoints: %+v",
-				clusterResponse.Message.LeaderName, s.nodesEndpoints)
+				clusterResponse.LeaderName, s.nodesEndpoints)
 		}
 
 		// Return StatusTemporaryRedirect, as only 307 and 308 statuses

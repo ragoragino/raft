@@ -10,7 +10,9 @@ import (
 
 	logrus "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type serverOptions struct {
@@ -40,6 +42,8 @@ func applyServerOptions(opts []ServerCallOption) *serverOptions {
 	return &options
 }
 
+// IClusterServer is an interface for servers used for internal communication
+// between Raft nodes
 type IClusterServer interface {
 	GetAppendEntriesChannel() (<-chan appendEntriesProcessRequest, error)
 	GetRequestVoteChannel() (<-chan requestVoteProcessRequest, error)
@@ -120,7 +124,7 @@ func (s *ClusterServer) Close() {
 
 func (s *ClusterServer) GetAppendEntriesChannel() (<-chan appendEntriesProcessRequest, error) {
 	if s.appendEntriesProcessChannel != nil {
-		return nil, fmt.Errorf("append entries channel was already taken.")
+		return nil, fmt.Errorf("append entries channel was already taken")
 	}
 
 	s.appendEntriesProcessChannel = make(chan appendEntriesProcessRequest)
@@ -128,7 +132,7 @@ func (s *ClusterServer) GetAppendEntriesChannel() (<-chan appendEntriesProcessRe
 }
 func (s *ClusterServer) GetRequestVoteChannel() (<-chan requestVoteProcessRequest, error) {
 	if s.requestVoteProcessChannel != nil {
-		return nil, fmt.Errorf("request vote channel was already taken.")
+		return nil, fmt.Errorf("request vote channel was already taken")
 	}
 
 	s.requestVoteProcessChannel = make(chan requestVoteProcessRequest)
@@ -136,6 +140,10 @@ func (s *ClusterServer) GetRequestVoteChannel() (<-chan requestVoteProcessReques
 }
 
 func (s *ClusterServer) AppendEntries(ctx context.Context, request *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	if s.appendEntriesProcessChannel == nil {
+		return nil, status.Error(codes.Unavailable, "raft engine has not started yet")
+	}
+
 	responseChannel := make(chan appendEntriesProcessResponse)
 
 	s.appendEntriesProcessChannel <- appendEntriesProcessRequest{
@@ -152,6 +160,10 @@ func (s *ClusterServer) AppendEntries(ctx context.Context, request *pb.AppendEnt
 }
 
 func (s *ClusterServer) RequestVote(ctx context.Context, request *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	if s.requestVoteProcessChannel == nil {
+		return nil, status.Error(codes.Unavailable, "raft engine has not started yet")
+	}
+
 	responseChannel := make(chan requestVoteProcessResponse)
 
 	s.requestVoteProcessChannel <- requestVoteProcessRequest{

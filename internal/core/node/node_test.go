@@ -28,11 +28,12 @@ import (
 // so writing proper unit tests could be helpful
 
 var (
-	startingStateInfo = PersistentStateInfo{
-		CurrentTerm: 0,
-		VotedFor:    nil,
-		Role:        FOLLOWER,
-	}
+	conservativeBulgarianConstant = 2
+	avgNetworkRoundTripTime       = 5 * time.Millisecond
+	timeToRestartProxy            = 5 * time.Second
+	maxNetworkRoundtripTime       = defaultRaftOptions.BroadcastTimeout
+	timeToElectLeader             = time.Duration(conservativeBulgarianConstant) * (defaultRaftOptions.MaxElectionTimeout + 2*maxNetworkRoundtripTime)
+	timeToReplicateMessage        = avgNetworkRoundTripTime
 )
 
 func initializeStatePersister(t *testing.T, logger *logrus.Entry, fileStatePath string) (persister.IStateLogger, func()) {
@@ -107,7 +108,7 @@ func constructClusterComponents(t *testing.T,
 			"node":      name,
 		})
 
-		fileStatePath := fmt.Sprintf("db_node_test_%s_State_%s.txt", t.Name(), name)
+		fileStatePath := fmt.Sprintf("db_node_test_%s_State_%s", t.Name(), name)
 		fileStateLogger, fileStateLoggerClean :=
 			initializeStatePersister(t, statePersisterLogger, fileStatePath)
 		cleanerFuncs = append(cleanerFuncs, fileStateLoggerClean)
@@ -117,22 +118,12 @@ func constructClusterComponents(t *testing.T,
 			"node":      name,
 		})
 
-		fileLogPath := fmt.Sprintf("db_node_test_%s_Log_%s.txt", t.Name(), name)
+		fileLogPath := fmt.Sprintf("db_node_test_%s_Log_%s", t.Name(), name)
 		fileLogLogger, fileLogLoggerClean :=
 			initializeLogEntryPersister(t, logEntryPersisterLogger, fileLogPath)
 		cleanerFuncs = append(cleanerFuncs, fileLogLoggerClean)
 
-		matchIndex := map[string]uint64{}
-		for name := range endpoints {
-			matchIndex[name] = 0
-		}
-
-		startingVolatileInfo := VolatileStateInfo{
-			CommitIndex: 0,
-			MatchIndex:  matchIndex,
-		}
-
-		stateHandler := NewStateManager(startingStateInfo, startingVolatileInfo, fileStateLogger)
+		stateHandler := NewStateManager(fileStateLogger)
 		logHandler := NewLogEntryManager(fileLogLogger)
 
 		stateMachineLogger := logger.WithFields(logrus.Fields{
@@ -162,7 +153,7 @@ func startClusterServers(t *testing.T, clusterServers map[string]*ClusterServer)
 			defer wgServer.Done()
 			err := clusterServer.Run()
 			if err != nil {
-				fmt.Errorf("running cluster server failed: %+v", err)
+				t.Logf("running cluster server failed: %+v", err)
 				t.FailNow()
 			}
 		}(clusterServer)
@@ -186,20 +177,24 @@ func startClusterClients(t *testing.T, clusterClients map[string]*Cluster, endpo
 	}
 }
 
-func startRaftEngines(rafts map[string]*Raft) *sync.WaitGroup {
+func startRaftEngines(t *testing.T, rafts map[string]*Raft) *sync.WaitGroup {
 	wgRaft := sync.WaitGroup{}
 	wgRaft.Add(len(rafts))
 	for _, raft := range rafts {
 		go func(raft *Raft) {
 			defer wgRaft.Done()
-			raft.Run()
+			err := raft.Run()
+			if err != nil {
+				t.Logf("running raft engine failed: %+v", err)
+				t.FailNow()
+			}
 		}(raft)
 	}
 
 	return &wgRaft
 }
 
-func startHttpServer(t *testing.T, httpServers map[string]external_server.Interface) *sync.WaitGroup {
+func startHTTPServer(t *testing.T, httpServers map[string]external_server.Interface) *sync.WaitGroup {
 	wgHTTP := sync.WaitGroup{}
 	wgHTTP.Add(len(httpServers))
 	for _, httpServer := range httpServers {
@@ -207,7 +202,7 @@ func startHttpServer(t *testing.T, httpServers map[string]external_server.Interf
 			defer wgHTTP.Done()
 			err := server.Run()
 			if err != nil {
-				fmt.Errorf("running http server failed: %+v", err)
+				t.Logf("running http server failed: %+v", err)
 				t.FailNow()
 			}
 		}(httpServer)
@@ -243,11 +238,10 @@ func TestLeaderElected(t *testing.T) {
 
 	startClusterClients(t, clusterClients, endpoints)
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
 	// Check if leader was elected
-	timeToLeader := defaultRaftOptions.MaxElectionTimeout + defaultRaftOptions.MinElectionTimeout
-	time.Sleep(timeToLeader * 2)
+	time.Sleep(timeToElectLeader)
 
 	leaderExists := false
 	for _, raft := range rafts {
@@ -370,11 +364,10 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
 	// Check if leader was elected
-	timeToLeader := defaultRaftOptions.MaxElectionTimeout + defaultRaftOptions.MinElectionTimeout
-	time.Sleep(timeToLeader * 2)
+	time.Sleep(timeToElectLeader)
 
 	oldLeaderID := ""
 	for _, raft := range rafts {
@@ -400,7 +393,7 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 	}
 
 	// Check if leader was elected
-	time.Sleep(timeToLeader * 2)
+	time.Sleep(timeToElectLeader)
 
 	newLeaderID := ""
 	for _, raft := range rafts {
@@ -424,7 +417,7 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 
 	// Check if the old leader respects the new one
 	// Increase the sleep a bit due to proxies restarting
-	time.Sleep(timeToLeader * 3)
+	time.Sleep(timeToRestartProxy + timeToElectLeader)
 
 	assert.Equal(t, clusterClients[oldLeaderID].GetClusterState().leaderName, newLeaderID)
 
@@ -445,7 +438,7 @@ func TestLeaderElectedAfterPartition(t *testing.T) {
 	wgRaft.Wait()
 }
 
-func TestCreateAndGetDocuments(t *testing.T) {
+func TestCreateGetAndDeleteDocuments(t *testing.T) {
 	logrus.SetLevel(logrus.DebugLevel)
 
 	logger := logrus.StandardLogger()
@@ -472,13 +465,12 @@ func TestCreateAndGetDocuments(t *testing.T) {
 
 	startClusterClients(t, clusterClients, endpoints)
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
-	wgHTTP := startHttpServer(t, httpServers)
+	wgHTTP := startHTTPServer(t, httpServers)
 
 	// Wait for the election of leader
-	timeToWait := defaultRaftOptions.MaxElectionTimeout + defaultRaftOptions.MinElectionTimeout
-	time.Sleep(2 * timeToWait)
+	time.Sleep(timeToElectLeader)
 
 	startRequestsSend := time.Now()
 
@@ -492,6 +484,7 @@ func TestCreateAndGetDocuments(t *testing.T) {
 	nOfClientRequests := 1000
 	workerCreateRequestChannel := make(chan *external_server.ClientCreateRequest, nOfClientRequests)
 	workerGetRequestChannel := make(chan *external_server.ClientCreateRequest, nOfClientRequests)
+	workerDeleteRequestChannel := make(chan *external_server.ClientCreateRequest, nOfClientRequests)
 	for i := 0; i != nOfClientRequests; i++ {
 		key := fmt.Sprintf("key-%d", i)
 		request := &external_server.ClientCreateRequest{
@@ -501,9 +494,11 @@ func TestCreateAndGetDocuments(t *testing.T) {
 
 		workerCreateRequestChannel <- request
 		workerGetRequestChannel <- request
+		workerDeleteRequestChannel <- request
 	}
 
 	close(workerCreateRequestChannel)
+	close(workerDeleteRequestChannel)
 	close(workerGetRequestChannel)
 
 	wgClientCreateRequests := sync.WaitGroup{}
@@ -513,15 +508,15 @@ func TestCreateAndGetDocuments(t *testing.T) {
 			defer wgClientCreateRequests.Done()
 
 			for request := range workerCreateRequestChannel {
-				createRequestJson, err := json.Marshal(request)
+				createRequestJSON, err := json.Marshal(request)
 				assert.NoError(t, err)
 
-				createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJson))
+				createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJSON))
 				assert.NoError(t, err)
 
 				// Set GetBody so that client can copy body to follow redirects
 				createRequest.GetBody = func() (io.ReadCloser, error) {
-					return ioutil.NopCloser(bytes.NewBuffer(createRequestJson)), nil
+					return ioutil.NopCloser(bytes.NewBuffer(createRequestJSON)), nil
 				}
 
 				createResponse, err := client.Do(createRequest)
@@ -538,7 +533,7 @@ func TestCreateAndGetDocuments(t *testing.T) {
 	endRequestsSend := time.Now()
 
 	// Allow the followers to update their state machines via leader heartbeats
-	time.Sleep(5 * time.Second)
+	time.Sleep(timeToReplicateMessage * time.Duration(nOfClientRequests))
 
 	startRequestsGet := time.Now()
 
@@ -550,28 +545,28 @@ func TestCreateAndGetDocuments(t *testing.T) {
 			defer wgClientGetRequests.Done()
 
 			for request := range workerGetRequestChannel {
-				getRequestJson, err := json.Marshal(&external_server.ClientGetRequest{
+				getRequestJSON, err := json.Marshal(&external_server.ClientGetRequest{
 					Key: request.Key,
 				})
 				assert.NoError(t, err)
 
-				getRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/get", bytes.NewBuffer(getRequestJson))
+				getRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/get", bytes.NewBuffer(getRequestJSON))
 				assert.NoError(t, err)
 
 				// Set GetBody so that client can copy body to follow redirects
 				getRequest.GetBody = func() (io.ReadCloser, error) {
-					return ioutil.NopCloser(bytes.NewBuffer(getRequestJson)), nil
+					return ioutil.NopCloser(bytes.NewBuffer(getRequestJSON)), nil
 				}
 
 				getResponse, err := client.Do(getRequest)
 				assert.NoError(t, err)
 				assert.Equal(t, http.StatusOK, getResponse.StatusCode)
 
-				getResponseJson, err := ioutil.ReadAll(getResponse.Body)
+				getResponseJSON, err := ioutil.ReadAll(getResponse.Body)
 				assert.NoError(t, err)
 
 				response := &external_server.ClientGetResponse{}
-				err = json.Unmarshal(getResponseJson, response)
+				err = json.Unmarshal(getResponseJSON, response)
 				assert.NoError(t, err)
 
 				assert.Equal(t, request.Value, response.Value)
@@ -584,6 +579,76 @@ func TestCreateAndGetDocuments(t *testing.T) {
 	wgClientGetRequests.Wait()
 
 	endRequestsGet := time.Now()
+	startRequestsDelete := time.Now()
+
+	// Delete key-value pairs from Raft
+	workerGetRequestChannel = make(chan *external_server.ClientCreateRequest, nOfClientRequests)
+
+	wgClientDeleteRequests := sync.WaitGroup{}
+	wgClientDeleteRequests.Add(nOfWorkers)
+	for i := 0; i != nOfWorkers; i++ {
+		go func() {
+			defer wgClientDeleteRequests.Done()
+
+			for request := range workerDeleteRequestChannel {
+				deleteRequestJSON, err := json.Marshal(&external_server.ClientDeleteRequest{
+					Key: request.Key,
+				})
+				assert.NoError(t, err)
+
+				getRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/delete", bytes.NewBuffer(deleteRequestJSON))
+				assert.NoError(t, err)
+
+				// Set GetBody so that client can copy body to follow redirects
+				getRequest.GetBody = func() (io.ReadCloser, error) {
+					return ioutil.NopCloser(bytes.NewBuffer(deleteRequestJSON)), nil
+				}
+
+				getResponse, err := client.Do(getRequest)
+				assert.NoError(t, err)
+				assert.Equal(t, http.StatusOK, getResponse.StatusCode)
+
+				workerGetRequestChannel <- request
+			}
+		}()
+	}
+
+	wgClientDeleteRequests.Wait()
+
+	close(workerGetRequestChannel)
+
+	endRequestsDelete := time.Now()
+
+	// Allow the followers to update their state machines via leader heartbeats
+	time.Sleep(timeToReplicateMessage * time.Duration(nOfClientRequests))
+
+	wgClientGetRequests.Add(nOfWorkers)
+	for i := 0; i != nOfWorkers; i++ {
+		go func() {
+			defer wgClientGetRequests.Done()
+
+			for request := range workerGetRequestChannel {
+				getRequestJSON, err := json.Marshal(&external_server.ClientGetRequest{
+					Key: request.Key,
+				})
+				assert.NoError(t, err)
+
+				getRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/get", bytes.NewBuffer(getRequestJSON))
+				assert.NoError(t, err)
+
+				// Set GetBody so that client can copy body to follow redirects
+				getRequest.GetBody = func() (io.ReadCloser, error) {
+					return ioutil.NopCloser(bytes.NewBuffer(getRequestJSON)), nil
+				}
+
+				getResponse, err := client.Do(getRequest)
+				assert.NoError(t, err)
+				assert.Equal(t, http.StatusNotFound, getResponse.StatusCode)
+			}
+		}()
+	}
+
+	wgClientGetRequests.Wait()
 
 	// Close HTTP and cluster servers, Raft instances and cluster clients down
 	for _, httpServer := range httpServers {
@@ -607,8 +672,9 @@ func TestCreateAndGetDocuments(t *testing.T) {
 	wgRaft.Wait()
 	wgHTTP.Wait()
 
-	logger.Printf("Sending requests took: %+v, Getting requests took: %+v",
-		endRequestsSend.Sub(startRequestsSend), endRequestsGet.Sub(startRequestsGet))
+	logger.Printf(`Sending requests took: %+v, Getting requests took: %+v, Deleting 
+		requests took: %+v`, endRequestsSend.Sub(startRequestsSend), endRequestsGet.Sub(startRequestsGet),
+		endRequestsDelete.Sub(startRequestsDelete))
 }
 
 func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
@@ -662,13 +728,12 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
-	wgHTTP := startHttpServer(t, httpServers)
+	wgHTTP := startHTTPServer(t, httpServers)
 
 	// Wait for the election of leader
-	timeToWait := defaultRaftOptions.MaxElectionTimeout + defaultRaftOptions.MinElectionTimeout
-	time.Sleep(2 * timeToWait)
+	time.Sleep(timeToElectLeader)
 
 	// Find a leader and one non-leader node
 	var nonLeaderNode string
@@ -705,15 +770,15 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 
 		clientCreateRequests[key] = request
 
-		createRequestJson, err := json.Marshal(request)
+		createRequestJSON, err := json.Marshal(request)
 		assert.NoError(t, err)
 
-		createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJson))
+		createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJSON))
 		assert.NoError(t, err)
 
 		// Set GetBody so that client can copy body to follow redirects
 		createRequest.GetBody = func() (io.ReadCloser, error) {
-			return ioutil.NopCloser(bytes.NewBuffer(createRequestJson)), nil
+			return ioutil.NopCloser(bytes.NewBuffer(createRequestJSON)), nil
 		}
 
 		createResponse, err := client.Do(createRequest)
@@ -748,15 +813,15 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 
 		clientCreateRequests[key] = request
 
-		createRequestJson, err := json.Marshal(request)
+		createRequestJSON, err := json.Marshal(request)
 		assert.NoError(t, err)
 
-		createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJson))
+		createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJSON))
 		assert.NoError(t, err)
 
 		// Set GetBody so that client can copy body to follow redirects
 		createRequest.GetBody = func() (io.ReadCloser, error) {
-			return ioutil.NopCloser(bytes.NewBuffer(createRequestJson)), nil
+			return ioutil.NopCloser(bytes.NewBuffer(createRequestJSON)), nil
 		}
 
 		createResponse, err := client.Do(createRequest)
@@ -776,7 +841,7 @@ func TestCreateAndGetDocumentsForAFailedNode(t *testing.T) {
 	}
 
 	// Wait for the replication of documents
-	time.Sleep(10 * time.Second)
+	time.Sleep(timeToRestartProxy + timeToReplicateMessage*time.Duration(nOfTotalRequests-nOfStartingRequests))
 
 	// Get documents from the previously failed node's state machine
 	failedNode, ok := rafts[nonLeaderNode]
@@ -838,13 +903,12 @@ func TestContinuousTraffic(t *testing.T) {
 
 	startClusterClients(t, clusterClients, endpoints)
 
-	wgRaft := startRaftEngines(rafts)
+	wgRaft := startRaftEngines(t, rafts)
 
-	wgHTTP := startHttpServer(t, httpServers)
+	wgHTTP := startHTTPServer(t, httpServers)
 
 	// Wait for the election of leader
-	timeToWait := defaultRaftOptions.MaxElectionTimeout + defaultRaftOptions.MinElectionTimeout
-	time.Sleep(2 * timeToWait)
+	time.Sleep(timeToElectLeader)
 
 	client := &http.Client{}
 
@@ -880,15 +944,15 @@ func TestContinuousTraffic(t *testing.T) {
 					Value: []byte(fmt.Sprintf("value-%d", i)),
 				}
 
-				createRequestJson, err := json.Marshal(request)
+				createRequestJSON, err := json.Marshal(request)
 				assert.NoError(t, err)
 
-				createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJson))
+				createRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/create", bytes.NewBuffer(createRequestJSON))
 				assert.NoError(t, err)
 
 				// Set GetBody so that client can copy body to follow redirects
 				createRequest.GetBody = func() (io.ReadCloser, error) {
-					return ioutil.NopCloser(bytes.NewBuffer(createRequestJson)), nil
+					return ioutil.NopCloser(bytes.NewBuffer(createRequestJSON)), nil
 				}
 
 				createResponse, err := client.Do(createRequest)
@@ -924,28 +988,28 @@ func TestContinuousTraffic(t *testing.T) {
 				expectedReplicationTime := event.time.Add(5 * time.Second)
 				<-time.After(expectedReplicationTime.Sub(time.Now()))
 
-				getRequestJson, err := json.Marshal(&external_server.ClientGetRequest{
+				getRequestJSON, err := json.Marshal(&external_server.ClientGetRequest{
 					Key: event.request.Key,
 				})
 				assert.NoError(t, err)
 
-				getRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/get", bytes.NewBuffer(getRequestJson))
+				getRequest, err := http.NewRequest("POST", "http://"+httpEndpoint+"/get", bytes.NewBuffer(getRequestJSON))
 				assert.NoError(t, err)
 
 				// Set GetBody so that client can copy body to follow redirects
 				getRequest.GetBody = func() (io.ReadCloser, error) {
-					return ioutil.NopCloser(bytes.NewBuffer(getRequestJson)), nil
+					return ioutil.NopCloser(bytes.NewBuffer(getRequestJSON)), nil
 				}
 
 				getResponse, err := client.Do(getRequest)
 				assert.NoError(t, err)
 				assert.Equal(t, http.StatusOK, getResponse.StatusCode)
 
-				getResponseJson, err := ioutil.ReadAll(getResponse.Body)
+				getResponseJSON, err := ioutil.ReadAll(getResponse.Body)
 				assert.NoError(t, err)
 
 				response := &external_server.ClientGetResponse{}
-				err = json.Unmarshal(getResponseJson, response)
+				err = json.Unmarshal(getResponseJSON, response)
 				assert.NoError(t, err)
 
 				assert.Equal(t, event.request.Value, response.Value)

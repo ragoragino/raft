@@ -1,9 +1,18 @@
 package node
 
 import (
-	"github.com/google/uuid"
-	logrus "github.com/sirupsen/logrus"
+	"fmt"
 	"raft/internal/core/persister"
+
+	"github.com/google/uuid"
+)
+
+var (
+	startingStateInfo = PersistentStateInfo{
+		CurrentTerm: 0,
+		VotedFor:    nil,
+		Role:        FOLLOWER,
+	}
 )
 
 type PersistentStateInfo struct {
@@ -14,7 +23,6 @@ type PersistentStateInfo struct {
 
 type VolatileStateInfo struct {
 	CommitIndex uint64
-	MatchIndex  map[string]uint64
 }
 
 type StateSwitched struct {
@@ -22,6 +30,7 @@ type StateSwitched struct {
 	newState PersistentStateInfo
 }
 
+// IStateManager provides interface for managing Raft state variables
 type IStateManager interface {
 	AddPersistentStateObserver(handler chan StateSwitched) string
 	RemovePersistentStateObserver(id string)
@@ -33,8 +42,6 @@ type IStateManager interface {
 
 	SetCommitIndex(uint64)
 	GetCommitIndex() uint64
-	GetMatchIndexes() map[string]uint64
-	SetMatchIndex(nodeID string, index uint64)
 }
 
 type StateManager struct {
@@ -49,15 +56,27 @@ type StateManager struct {
 // StateManager is not safe for concurrent usage, as it is expected to be used
 // mainly with transaction operations. Therefore, clients using StateManager should
 // implement appropriate locking mechanisms
-func NewStateManager(stateInfo PersistentStateInfo, volatileInfo VolatileStateInfo, statePersister persister.IStateLogger) *StateManager {
-	statePersister.UpdateState(&persister.State{
-		VotedFor:    stateInfo.VotedFor,
-		CurrentTerm: stateInfo.CurrentTerm,
-	})
+func NewStateManager(statePersister persister.IStateLogger) *StateManager {
+	initialState := startingStateInfo
+	initialPersisterState := statePersister.GetState()
+	if initialPersisterState == nil {
+		statePersister.UpdateState(&persister.State{
+			VotedFor:    initialState.VotedFor,
+			CurrentTerm: initialState.CurrentTerm,
+		})
+	} else {
+		initialState = PersistentStateInfo{
+			CurrentTerm: initialState.CurrentTerm,
+			VotedFor:    initialState.VotedFor,
+			Role:        FOLLOWER,
+		}
+	}
 
 	return &StateManager{
-		persistentInfo: stateInfo,
-		volatileInfo:   volatileInfo,
+		persistentInfo: initialState,
+		volatileInfo: VolatileStateInfo{
+			CommitIndex: 0,
+		},
 		statePersister: statePersister,
 		handlers:       make(map[string]chan StateSwitched),
 	}
@@ -66,7 +85,7 @@ func NewStateManager(stateInfo PersistentStateInfo, volatileInfo VolatileStateIn
 func (s *StateManager) AddPersistentStateObserver(handler chan StateSwitched) string {
 	id, err := uuid.NewUUID()
 	if err != nil {
-		logrus.Panicf("unable to create new uuid: %+v", err)
+		panic(fmt.Sprintf("unable to create new uuid: %+v", err))
 	}
 
 	idStr := id.String()
@@ -116,12 +135,4 @@ func (s *StateManager) SetCommitIndex(commitIndex uint64) {
 
 func (s *StateManager) GetCommitIndex() uint64 {
 	return s.volatileInfo.CommitIndex
-}
-
-func (s *StateManager) GetMatchIndexes() map[string]uint64 {
-	return s.volatileInfo.MatchIndex
-}
-
-func (s *StateManager) SetMatchIndex(nodeID string, index uint64) {
-	s.volatileInfo.MatchIndex[nodeID] = index
 }
