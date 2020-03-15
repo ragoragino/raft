@@ -349,12 +349,12 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 		timer := NewTimer(electionTimeout)
 		defer timer.Close()
 
-		electionTimedChannel := make(chan struct{})
-		defer close(electionTimedChannel)
+		electionTimedOutChannel := make(chan struct{})
+		defer close(electionTimedOutChannel)
 
 		go func() {
 			for {
-				if _, ok := <-electionTimedChannel; !ok {
+				if _, ok := <-electionTimedOutChannel; !ok {
 					return
 				}
 
@@ -392,7 +392,7 @@ func (r *Raft) HandleRoleFollower(ctx context.Context) <-chan struct{} {
 					timer.Reset(electionTimeout)
 				}
 			case <-timer.After():
-				electionTimedChannel <- struct{}{}
+				electionTimedOutChannel <- struct{}{}
 
 				// Reset election timeout, so that we won't be always falling into this case
 				// when it takes some time to propagate the new state
@@ -454,13 +454,13 @@ func (r *Raft) HandleRoleCandidate(ctx context.Context) <-chan struct{} {
 	return doneChannel
 }
 
+// TODO: We could return from this function immediately as we receive the majority
 func (r *Raft) broadcastRequestVote(ctx context.Context) {
 	r.stateMutex.RLock()
-	lastLogIndex := r.logManager.GetLastLogIndex()
 	request := &pb.RequestVoteRequest{
 		Term:         r.stateManager.GetCurrentTerm(),
 		CandidateId:  r.settings.ID,
-		LastLogIndex: lastLogIndex,
+		LastLogIndex: r.logManager.GetLastLogIndex(),
 		LastLogTerm:  r.logManager.GetLastLogTerm(),
 	}
 	r.stateMutex.RUnlock()
@@ -480,6 +480,11 @@ func (r *Raft) broadcastRequestVote(ctx context.Context) {
 
 	// Count the number of votes
 	for _, response := range responses {
+		// Server was unable to respond
+		if response == nil {
+			continue
+		}
+
 		// If the response contains higher term, we convert to follower
 		if response.GetTerm() > r.stateManager.GetCurrentTerm() {
 			r.stateManager.SwitchPersistentState(response.GetTerm(), nil, FOLLOWER)
@@ -1053,7 +1058,8 @@ func (r *Raft) processClientCreateRequest(ctx context.Context, request *external
 		return external_server.Redirect
 	}
 
-	// TODO: Maybe check the state machine with the SN of the request ?
+	// TODO: Maybe check the state machine with the SN of the request in order to avoid
+	// the case of retried requests
 
 	previousLogIndex := r.logManager.GetLastLogIndex()
 	previousLogTerm := r.logManager.GetLastLogTerm()
@@ -1101,11 +1107,12 @@ func (r *Raft) processClientDeleteRequest(ctx context.Context, request *external
 	role := r.stateManager.GetRole()
 	if role != LEADER {
 		r.stateMutex.RUnlock()
-		logger.Errorf("unable to continue with processing client create request - not a leader")
+		logger.Errorf("unable to continue with processing client delete request - not a leader")
 		return external_server.Redirect
 	}
 
-	// TODO: Maybe check the state machine with the SN of the request ?
+	// TODO: Maybe check the state machine with the SN of the request in order to avoid
+	// the case of retried requests
 
 	previousLogIndex := r.logManager.GetLastLogIndex()
 	previousLogTerm := r.logManager.GetLastLogTerm()
@@ -1125,7 +1132,7 @@ func (r *Raft) processClientDeleteRequest(ctx context.Context, request *external
 	// Append client command to log
 	err := r.logManager.AppendEntries(newEntries)
 	if err != nil {
-		logger.Errorf("unable to append logs while processing client create request: %+v", err)
+		logger.Errorf("unable to append logs while processing client delete request: %+v", err)
 		return external_server.FailedInternal
 	}
 
@@ -1202,8 +1209,7 @@ func (r *Raft) broadcastAppendEntriesRequest(ctx context.Context, request *pb.Ap
 			}
 
 			successCallback := func() {
-				atomic.AddUint32(&countOfAcceptedReplies, 1)
-				value := atomic.LoadUint32(&countOfAcceptedReplies)
+				value := atomic.AddUint32(&countOfAcceptedReplies, 1)
 				sendMajorityReachedResponse(int(value))
 			}
 
@@ -1234,6 +1240,7 @@ func (r *Raft) broadcastAppendEntriesRequest(ctx context.Context, request *pb.Ap
 
 func (r *Raft) retryNodeAppendEntries(done <-chan struct{}, nodeID string) <-chan struct{} {
 	finishChannel := make(chan struct{})
+
 	go func() {
 		requestChannel, ok := r.retryNodeAppendEntriesChannels[nodeID]
 		if !ok {
