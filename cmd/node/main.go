@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	raft_node "raft/internal/core/node"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jessevdk/go-flags"
+
+	"strings"
 
 	"github.com/sirupsen/logrus"
 )
@@ -27,10 +30,46 @@ var opts struct {
 	Name string `long:"name" description:"Names of the endpoint" required:"true"`
 
 	// Names and cluster endpoints for other nodes
-	OtherNamedEndpoints map[string]string `long:"cluster-endpoints" description:"Names and addresses of other endpoints of the form name:endpoint" required:"true"`
+	OtherNamedEndpoints equalitySignDelimitedMap `long:"cluster-endpoints" description:"Names and addresses of other endpoints of the form name=endpoint" required:"true"`
 
 	// Names and cluster endpoints for other nodes
-	OtherNamedHTTPEndpoints map[string]string `long:"http-endpoints" description:"Names and HTTP addresses of other endpoints of the form name:endpoint"`
+	OtherNamedHTTPEndpoints equalitySignDelimitedMap `long:"http-endpoints" description:"Names and HTTP addresses of other endpoints of the form name=endpoint"`
+}
+
+type equalitySignDelimitedMap struct {
+	internalMap map[string]string
+}
+
+func (m *equalitySignDelimitedMap) MarshalFlag() (string, error) {
+	if m.internalMap == nil {
+		return "", nil
+	}
+
+	var result string
+	for k, v := range m.internalMap {
+		result += fmt.Sprintf("%s=%s", k, v)
+	}
+
+	return result, nil
+}
+
+func (m *equalitySignDelimitedMap) UnmarshalFlag(value string) error {
+	if m.internalMap == nil {
+		m.internalMap = make(map[string]string)
+	}
+
+	splitValues := strings.SplitN(value, "=", 2)
+	if len(splitValues) != 2 {
+		return fmt.Errorf("the value must be of the form 'key=value'")
+	}
+
+	m.internalMap[splitValues[0]] = splitValues[1]
+
+	return nil
+}
+
+func (m *equalitySignDelimitedMap) GetMap() map[string]string {
+	return m.internalMap
 }
 
 func main() {
@@ -95,7 +134,7 @@ func main() {
 	// TODO: We could write a manager service that will spawn the cluster and
 	// dynamically route requests to the leader based on redirect responses
 	HTTPEndpoints := map[string]string{}
-	for name, endpoint := range opts.OtherNamedHTTPEndpoints {
+	for name, endpoint := range opts.OtherNamedHTTPEndpoints.GetMap() {
 		HTTPEndpoints[name] = endpoint
 	}
 	externalServerLogger := logger.WithFields(logrus.Fields{
@@ -123,7 +162,7 @@ func main() {
 	}()
 
 	// Start cluster client
-	err = raftClusterClient.StartCluster(opts.OtherNamedEndpoints)
+	err = raftClusterClient.StartCluster(opts.OtherNamedEndpoints.GetMap())
 	if err != nil {
 		logger.Panicf("unable to start Raft cluster client: %+v", err)
 	}
