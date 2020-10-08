@@ -117,9 +117,9 @@ func New(endpoint string, nodesEndpoints map[string]string, logger *logrus.Entry
 	}
 
 	r := mux.NewRouter()
-	r.HandleFunc("/create", externalServer.handleCreate).Methods("POST")
-	r.HandleFunc("/delete", externalServer.handleDelete).Methods("POST")
-	r.HandleFunc("/get", externalServer.handleGet).Methods("POST")
+	r.HandleFunc("/api/v1/object", externalServer.handleCreate).Methods("POST")
+	r.HandleFunc("/api/v1/object", externalServer.handleDelete).Methods("DELETE")
+	r.HandleFunc("/api/v1/object", externalServer.handleGet).Methods("GET")
 
 	s := &http.Server{
 		Handler:      r,

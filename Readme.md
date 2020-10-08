@@ -1,35 +1,25 @@
-For spawning local nodes, run executable (cmd/node/main.go) in three different folders, e.g. like this:
+# raft
 
-```sh
-mkdir ${TMP_PATH} 
-cd ${RAFT_PROJECT_PATH}/cmd/node && go build -o ${TMP_PATH}
-```
+This project aims to be an examination of the RAFT protocol: "Ongaro, Diego, and John Ousterhout. "In search of an understandable consensus algorithm (extended version)." Retrieved July 20 (2016): 2018."
 
-```sh
-# First shell
-mkdir ${TMP_PATH}/node1 && cp ${TMP_PATH}/node ${TMP_PATH}/node1/node
-${TMP_PATH}/node1/node --http-endpoint localhost:8000 --cluster-endpoint localhost:9000 --name Node0 --http-endpoints Node1=localhost:8001 --http-endpoints Node2=localhost:8002 --cluster-endpoints Node1=localhost:9001 --cluster-endpoints Node2=localhost:9002
-```
+## Getting Started
 
-```sh
-# Second shell
-mkdir ${TMP_PATH}/node2 && cp ${TMP_PATH}/node ${TMP_PATH}/node2/node
-${TMP_PATH}/node2/node --http-endpoint localhost:8001 --cluster-endpoint localhost:9001 --name Node1 --http-endpoints Node0=localhost:8000 --http-endpoints Node2=localhost:8002 --cluster-endpoints Node0=localhost:9000 --cluster-endpoints Node2=localhost:9002
-```
+I have implemented a distributed key-value datastore with strong consistency provided by Raft protocol. Datastore allows CRUD operations and is accessible via a simple REST API.
 
-```sh
-# Third shell
-mkdir ${TMP_PATH}/node3 && cp ${TMP_PATH}/node ${TMP_PATH}/node3/node
-${TMP_PATH}/node3/node --http-endpoint localhost:8002 --cluster-endpoint localhost:9002 --name Node2 --http-endpoints Node1=localhost:8001 --http-endpoints Node0=localhost:8000 --cluster-endpoints Node1=localhost:9001 --cluster-endpoints Node0=localhost:9000
-```
+### Prerequisites
 
-```sh
-# Run a curl client and test create/get/delete "key-1" (e.g. with Base64 encoded "value-1" as the value)
-curl -L -v -d '{"Key":"key-1","Value":"dmFsdWUtMQ=="}' -H "Content-Type: application/json" -X POST http://localhost:8000/create # 200 OK
-sleep 5
-curl -L -v -d '{"Key":"key-1"}' -H "Content-Type: application/json" -X POST http://localhost:8000/get # 200 OK, receives {"Value":"dmFsdWUtMQ=="}
-sleep 5
-curl -L -v -d '{"Key":"key-1"}' -H "Content-Type: application/json" -X POST http://localhost:8000/delete # 200 OK
-sleep 5
-curl -L -v -d '{"Key":"key-1"}' -H "Content-Type: application/json" -X POST http://localhost:8000/get # 400 Not Found
-```
+- Go 1.13
+
+### Running
+
+See [./scripts/example.sh](https://github.com/ragoragino/raft/blob/master/scripts/example.sh) for an exemplary cluster creation and sending of requests (create, get, delete).
+
+### Running the tests
+
+I am using toxiproxy in the tests to simulate network failures. Therefore its executable (toxiproxy-server-linux-amd64 on Linux or toxiproxy-server-linux-amd64.exe on Windows) needs to be present in the project root.
+
+go test ./...
+
+## License
+
+This project is licensed under the MIT License.
